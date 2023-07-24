@@ -19,7 +19,6 @@
 #include <sys/stat.h>
 #include <pthread.h>
 #include <stdint.h>
-#include <stdint.h>
 
 #define BUFFER_SIZE	(32ull*1024ull*1024ull)
 #define NR_ROWS_BUF	(8192)
