@@ -1,7 +1,26 @@
 
+gwbsid
+------
+GNU/Weeb BSI Database Daemon
 
-export MYSQL_HOST=$(docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bsid-mysql);
-export MYSQL_USER=gnuweeb;
-export MYSQL_PASS=gnuweeb_bsid_123;
-export MYSQL_DB=bsid;
-export MYSQL_PORT=3306;
+## How to use
+
+  git clone https://github.com/alviroiskandar/gwbsid.git;
+  cd gwbsid;
+  make;
+  mkdir -v ./mysql_data;
+  docker-compose up -d;
+  export MYSQL_HOST=$(docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bsid-mysql)
+  export MYSQL_USER=gnuweeb
+  export MYSQL_PASS=gnuweeb_bsid_123
+  export MYSQL_DB=bsid
+  export MYSQL_PORT=3306
+  export MYSQL_TABLE=users
+  ./parser ddl /path/to/data/BANK_BSI/Databases/DPK/DPKI_20220831_RDG.csv;
+  # Create users table based on the DDL output (no instructions).
+  ./parser dml /path/to/data/BANK_BSI/Databases/DPK/DPKI_20220831_RDG.csv;
+
+
+-- Viro
+
+Updated-at: 2023-07-25

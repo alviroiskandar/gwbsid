@@ -125,6 +125,7 @@ struct worker {
 	uint32_t		nr_pending_works;
 	pthread_mutex_t		pending_wrk_lock;
 	pthread_cond_t		pending_wrk_cond;
+	const char		*table_name;
 };
 
 struct mysql_cred {
@@ -188,28 +189,28 @@ static void free_dt_rows(struct dt_rows *rows)
 
 static void *trim_ws(char *str)
 {
-	char *head, *tail;
+	unsigned char *head, *tail;
 	size_t len;
 
-	head = str;
-	while (*head == ' ' || *head == '\t')
+	head = (unsigned char *)str;
+	while (*head == ' ' || *head == '\t' || *head > 0x80)
 		head++;
 
 	/*
 	 * All spaces?
 	 */
-	len = strlen(head);
+	len = strlen((char *)head);
 	if (!len) {
 		*str = '\0';
 		return str;
 	}
 
 	tail = head + len - 1;
-	while (*tail == ' ' || *tail == '\t')
+	while (*tail == ' ' || *tail == '\t' || *tail > 0x80)
 		tail--;
 
 	tail[1] = '\0';
-	if (head != str)
+	if ((char *)head != str)
 		return memmove(str, head, tail - head + 2);
 
 	return str;
@@ -604,12 +605,174 @@ static struct mysql_wrk *get_mysql_worker(struct mysql_wrk_pool *pool)
 	return NULL;
 }
 
+static int calculate_buf_size(struct work_data *wd)
+{
+	int ret = (int)sizeof("INSERT INTO `TABLE_NAME` () VALUES ();");
+	size_t i;
+
+	ret += strlen(wd->worker->table_name);
+	for (i = 0; i < wd->col->nr_cols; i++)
+		ret += strlen(wd->col->cols[i]) + sizeof("``,  ");
+
+	ret += wd->nr_rows * wd->col->nr_cols * sizeof("?  ") + sizeof(",  ");
+	return ret;
+}
+
+static int build_query(struct work_data *wd, char **qp)
+{
+	char *buf, *orig;
+	int ret, rem;
+	size_t i, j;
+
+	rem = calculate_buf_size(wd);
+	orig = buf = malloc(rem);
+	if (!buf) {
+		fprintf(stderr, "Failed to allocate query\n");
+		return -ENOMEM;
+	}
+
+	ret = snprintf(buf, rem, "INSERT INTO `%s` (", wd->worker->table_name);
+	rem -= ret;
+	buf += ret;
+
+	for (i = 0; i < wd->col->nr_cols; i++) {
+		ret = snprintf(buf, rem, "`%s`", wd->col->cols[i]);
+		rem -= ret;
+		buf += ret;
+
+		if (i != wd->col->nr_cols - 1) {
+			ret = snprintf(buf, rem, ", ");
+			rem -= ret;
+			buf += ret;
+		}
+	}
+
+	ret = snprintf(buf, rem, ") VALUES ");
+	rem -= ret;
+	buf += ret;
+
+	for (i = 0; i < wd->nr_rows; i++) {
+		ret = snprintf(buf, rem, "(");
+		rem -= ret;
+		buf += ret;
+
+		for (j = 0; j < wd->col->nr_cols; j++) {
+			ret = snprintf(buf, rem, "?");
+			rem -= ret;
+			buf += ret;
+
+			if (j != wd->col->nr_cols - 1) {
+				ret = snprintf(buf, rem, ", ");
+				rem -= ret;
+				buf += ret;
+			}
+		}
+
+		ret = snprintf(buf, rem, ")");
+		rem -= ret;
+		buf += ret;
+
+		if (i != wd->nr_rows - 1) {
+			ret = snprintf(buf, rem, ", ");
+			rem -= ret;
+			buf += ret;
+		}
+	}
+
+	*qp = orig;
+	return 0;
+}
+
+static int __insert_to_db(struct mysql_wrk *wrk, struct work_data *wd, const char *q)
+{
+	MYSQL_BIND *bind = NULL;
+	bool *is_null = NULL;
+	MYSQL_STMT *stmt;
+	int ret = 0;
+	size_t i, j;
+
+	stmt = mysql_stmt_init(wrk->conn);
+	if (!stmt) {
+		fprintf(stderr, "Failed to initialize mysql statement\n");
+		return -ENOMEM;
+	}
+
+	ret = mysql_stmt_prepare(stmt, q, strlen(q));
+	if (ret) {
+		fprintf(stderr, "Failed to prepare mysql statement: %s\n", mysql_error(wrk->conn));
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	bind = calloc(wd->col->nr_cols * wd->nr_rows, sizeof(*bind));
+	if (!bind) {
+		fprintf(stderr, "Failed to allocate bind\n");
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	is_null = calloc(wd->col->nr_cols * wd->nr_rows, sizeof(*is_null));
+	if (!is_null) {
+		fprintf(stderr, "Failed to allocate is_null\n");
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	for (i = 0; i < wd->nr_rows; i++) {
+		for (j = 0; j < wd->col->nr_cols; j++) {
+			size_t idx = i * wd->col->nr_cols + j;
+			MYSQL_BIND *b = &bind[idx];
+			char *data = wd->rows[i].data[j];
+
+			if (!strcmp(data, "NULL")) {
+				is_null[idx] = true;
+				b->buffer_type = MYSQL_TYPE_NULL;
+				continue;
+			}
+
+			b->buffer_type = MYSQL_TYPE_STRING;
+			b->buffer = data;
+			b->buffer_length = strlen(data);
+		}
+	}
+
+	ret = mysql_stmt_bind_param(stmt, bind);
+	if (ret) {
+		fprintf(stderr, "Failed to bind mysql statement: %s\n", mysql_error(wrk->conn));
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ret = mysql_stmt_execute(stmt);
+	if (ret) {
+		fprintf(stderr, "Failed to execute mysql statement: %s\n", mysql_error(wrk->conn));
+		ret = -ENOMEM;
+	}
+out:
+	free(is_null);
+	free(bind);
+	mysql_stmt_close(stmt);
+	return ret;
+}
+
 static void post_db_work_callback(struct mysql_wrk *wrk, void *arg)
 {
 	struct work_data *wd = arg;
 	struct worker *main_wrk = wd->worker;
+	char *q = NULL;
 
+	if (build_query(wd, &q)) {
+		g_stop = true;
+		goto out;
+	}
 
+	if (__insert_to_db(wrk, wd, q)) {
+		g_stop = true;
+		goto out;
+	}
+
+out:
+	free(q);
 	pthread_mutex_lock(&main_wrk->pending_wrk_lock);
 	if (--main_wrk->nr_pending_works == 0)
 		pthread_cond_signal(&main_wrk->pending_wrk_cond);
@@ -621,7 +784,6 @@ static int post_db_work(struct worker *wrk, struct work_data *wd)
 {
 	struct mysql_wrk_pool *pool = &wrk->mysql_pool;
 	struct mysql_wrk *wrk_tmp;
-	int ret;
 
 	pthread_mutex_lock(&pool->lock);
 	wrk_tmp = get_mysql_worker(pool);
@@ -648,7 +810,17 @@ static int insert_to_db(struct worker *wrk, struct dt_columns *col, struct dt_ro
 
 	pthread_mutex_lock(&wrk->pending_wrk_lock);
 	for (i = 0; i < nr_workers; i++) {
+		uint32_t nr_rows_to_post, idx;
 		struct work_data *wd;
+
+		idx = i * (nr_rows / nr_workers);
+		if (i == nr_workers - 1)
+			nr_rows_to_post = nr_rows - idx;
+		else
+			nr_rows_to_post = nr_rows / nr_workers;
+
+		if (!nr_rows_to_post)
+			break;
 
 		wd = malloc(sizeof(*wd));
 		if (!wd) {
@@ -659,11 +831,8 @@ static int insert_to_db(struct worker *wrk, struct dt_columns *col, struct dt_ro
 
 		wd->worker = wrk;
 		wd->col = col;
-		wd->rows = &rows->rows[i * nr_rows / nr_workers];
-		if (i == nr_workers - 1)
-			wd->nr_rows = nr_rows - (i * nr_rows / nr_workers);
-		else
-			wd->nr_rows = nr_rows / nr_workers;
+		wd->rows = rows->rows + idx;
+		wd->nr_rows = nr_rows_to_post;
 
 		printf("Posting work %zu: %zu rows\n", i, wd->nr_rows);
 		post_db_work(wrk, wd);
@@ -825,9 +994,9 @@ static void *worker_func(void *arg)
 		}
 
 		/*
-		 * Don't let the buffer grow too big.
+		 * Don't let the buffer grow too big. (524288)
 		 */
-		if (wrk->nr_lines % 524288 == 0) {
+		if (wrk->nr_lines % 20480 == 0) {
 			printf("Parsed %llu lines\n", (unsigned long long) wrk->nr_lines);
 			err = flush_rows(wrk, &wrk->columns, &wrk->rows);
 			if (err) {
@@ -855,7 +1024,7 @@ out:
 	return ret;
 }
 
-static int parse_mysql_env(struct mysql_cred *cred)
+static int parse_mysql_env(struct mysql_cred *cred, struct worker *wrk)
 {
 	char *tmp;
 	int port;
@@ -887,6 +1056,13 @@ static int parse_mysql_env(struct mysql_cred *cred)
 		return -EINVAL;
 	}
 	cred->db = tmp;
+
+	tmp = getenv("MYSQL_TABLE");
+	if (!tmp) {
+		fprintf(stderr, "MYSQL_TABLE is not set\n");
+		return -EINVAL;
+	}
+	wrk->table_name = tmp;
 
 	tmp = getenv("MYSQL_PORT");
 	if (!tmp) {
@@ -1095,7 +1271,7 @@ int main(int argc, char **argv)
 	if (!strcmp(argv[1], "ddl")) {
 		run_mode = MODE_DDL;
 	} else if (!strcmp(argv[1], "dml")) {
-		ret = parse_mysql_env(&mysql_cred);
+		ret = parse_mysql_env(&mysql_cred, &worker);
 		if (ret) {
 			fprintf(stderr, "Failed to parse mysql env\n");
 			return ret;
