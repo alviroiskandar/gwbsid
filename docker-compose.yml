@@ -1,0 +1,20 @@
+
+services:
+  gwmysql:
+    restart: unless-stopped
+    image: mysql:8.0.33-debian
+    container_name: bsid-mysql
+    hostname: bsid
+    environment:
+      MYSQL_ROOT_PASSWORD: gnuweeb_bsid_123
+      MYSQL_DATABASE: bsid
+      MYSQL_USER: gnuweeb
+      MYSQL_PASSWORD: gnuweeb_bsid_123
+    volumes:
+      - ./mysql_data/data:/var/lib/mysql
+
+  adminer:
+    image: adminer
+    restart: always
+    ports:
+      - 8123:8080

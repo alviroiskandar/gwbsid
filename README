@@ -1,0 +1,7 @@
+
+
+export MYSQL_HOST=$(docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' bsid-mysql);
+export MYSQL_USER=gnuweeb;
+export MYSQL_PASS=gnuweeb_bsid_123;
+export MYSQL_DB=bsid;
+export MYSQL_PORT=3306;

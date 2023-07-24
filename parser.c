@@ -19,9 +19,12 @@
 #include <sys/stat.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <signal.h>
+#include <stdatomic.h>
 
-#define BUFFER_SIZE	(32ull*1024ull*1024ull)
-#define NR_ROWS_BUF	(8192)
+#define BUFFER_SIZE		(32ull*1024ull*1024ull)
+#define NR_ROWS_BUF		(8192)
+#define NR_MYSQL_WORKERS	(16)
 
 struct dt_lmarks {
 	uint32_t	*marks;
@@ -70,9 +73,34 @@ struct dt_rows {
 	size_t		nr_alloc;
 };
 
+struct mysql_wrk;
+
+struct mysql_wrk {
+	pthread_t		thread;
+	MYSQL			*conn;
+	void 			*arg;
+	void			(*cb)(struct mysql_wrk *wrk, void *arg);
+	volatile bool		is_used;
+	struct mysql_wrk_pool	*pool;
+	uint32_t		tid;
+};
+
+struct mysql_wrk_pool {
+	struct mysql_wrk	*wrk;
+	size_t			nr_wrk;
+	pthread_mutex_t		lock;
+	pthread_cond_t		cond;
+	_Atomic(uint32_t)	nr_ready_wrk;
+};
+
+struct work_data {
+	struct dt_columns	*col;
+	struct dt_rows		*rows;
+	_Atomic(int)		refcnt;
+};
+
 struct worker {
 	FILE			*fp;
-	MYSQL			*conn;
 
 	/*
 	 * Line markers. Used to determine the row width.
@@ -91,7 +119,7 @@ struct worker {
 
 	uint64_t		nr_lines;
 
-	pthread_t		thread;
+	struct mysql_wrk_pool	mysql_pool;
 };
 
 struct mysql_cred {
@@ -104,6 +132,7 @@ struct mysql_cred {
 
 static struct mysql_cred mysql_cred;
 static uint8_t run_mode;
+static volatile bool g_stop;
 
 static inline void *ERR_PTR(long error)
 {
@@ -671,7 +700,7 @@ static void *worker_func(void *arg)
 	free(col);
 	col = NULL;
 
-	while (1) {
+	while (!g_stop) {
 		line = fgets_kill_crlf(buf, BUFFER_SIZE, wrk->fp);
 		if (!line)
 			break;
@@ -709,7 +738,6 @@ static void *worker_func(void *arg)
 	printf("Total parsed lines: %llu\n", (unsigned long long) wrk->nr_lines);
 	if (run_mode == MODE_DDL)
 		dump_column_heuristic(&wrk->columns);
-
 out:
 	free_dt_columns(&wrk->columns);
 	free_dt_lmarks(&wrk->lmarks);
@@ -768,6 +796,179 @@ static int parse_mysql_env(struct mysql_cred *cred)
 	return 0;
 }
 
+static int sql_worker_thread_init(struct mysql_wrk *wrk)
+{
+	wrk->cb = NULL;
+	wrk->arg = NULL;
+	wrk->is_used = false;
+
+	wrk->conn = mysql_init(NULL);
+	if (!wrk->conn) {
+		g_stop = true;
+		fprintf(stderr, "Failed to initialize mysql\n");
+		return -ENOMEM;
+	}
+
+	if (!mysql_real_connect(wrk->conn, mysql_cred.host, mysql_cred.user, mysql_cred.pass,
+				mysql_cred.db, mysql_cred.port, NULL, 0)) {
+		fprintf(stderr, "Failed to connect to mysql: %s\n", mysql_error(wrk->conn));
+		mysql_close(wrk->conn);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static void *sql_worker_func(void *arg)
+{
+	struct mysql_wrk *wrk = arg;
+	struct mysql_wrk_pool *pool = wrk->pool;
+	int ret;
+
+	ret = sql_worker_thread_init(wrk);
+	if (ret) {
+		g_stop = true;
+		return NULL;
+	}
+
+	atomic_fetch_add(&pool->nr_ready_wrk, 1);
+	printf("MySQL worker %04u is ready\n", wrk->tid);
+	pthread_mutex_lock(&pool->lock);
+
+	while (!g_stop) {
+		if (!wrk->is_used) {
+			pthread_cond_wait(&pool->cond, &pool->lock);
+			continue;
+		}
+		pthread_mutex_unlock(&pool->lock);
+
+		wrk->cb(wrk, wrk->arg);
+
+		pthread_mutex_lock(&pool->lock);
+		wrk->is_used = false;
+		wrk->arg = NULL;
+		wrk->cb = NULL;
+	}
+
+	pthread_mutex_unlock(&pool->lock);
+	mysql_close(wrk->conn);
+	mysql_thread_end();
+	printf("MySQL worker %04u is exiting...\n", wrk->tid);
+	return NULL;
+}
+
+static void sigaction_handler(int sig)
+{
+	char c = '\n';
+	g_stop = true;
+	sig = write(STDOUT_FILENO, &c, 1);
+	if (sig < 0)
+		exit(-EINVAL);
+}
+
+static int setup_sigaction(void)
+{
+	struct sigaction act = { .sa_handler = sigaction_handler };
+	int ret;
+
+	ret = sigaction(SIGINT, &act, NULL);
+	if (ret)
+		goto err;
+	ret = sigaction(SIGTERM, &act, NULL);
+	if (ret)
+		goto err;
+	act.sa_handler = SIG_IGN;
+	ret = sigaction(SIGPIPE, &act, NULL);
+	if (ret)
+		goto err;
+
+	return 0;
+
+err:
+	ret = errno;
+	perror("sigaction");
+	return ret;
+}
+
+static int start_mysql_workers(struct mysql_wrk_pool *pool, size_t nr_workers)
+{
+	struct mysql_wrk *wrk;
+	uint32_t i;
+	int ret;
+
+	pool->wrk = calloc(nr_workers, sizeof(*pool->wrk));
+	if (!pool->wrk) {
+		fprintf(stderr, "Failed to allocate mysql workers\n");
+		return -ENOMEM;
+	}
+
+	pool->nr_wrk = nr_workers;
+	ret = pthread_mutex_init(&pool->lock, NULL);
+	if (ret) {
+		fprintf(stderr, "Failed to initialize mysql worker mutex: %s\n", strerror(ret));
+		goto out_free_wrk;
+	}
+
+	ret = pthread_cond_init(&pool->cond, NULL);
+	if (ret) {
+		fprintf(stderr, "Failed to initialize mysql worker cond: %s\n", strerror(ret));
+		goto out_free_mutex;
+	}
+
+	for (i = 0; i < nr_workers; i++) {
+		wrk = &pool->wrk[i];
+		wrk->pool = pool;
+		wrk->tid = i;
+		ret = pthread_create(&wrk->thread, NULL, &sql_worker_func, wrk);
+		if (ret) {
+			fprintf(stderr, "Failed to create mysql worker thread: %s\n", strerror(ret));
+			goto out_free_threads;
+		}
+	}
+
+	return 0;
+
+out_free_threads:
+	pthread_mutex_lock(&pool->lock);
+	g_stop = true;
+	pthread_cond_broadcast(&pool->cond);
+	pthread_mutex_unlock(&pool->lock);
+
+	printf("Waiting for mysql workers to exit...\n");
+	while (i--) {
+		wrk = &pool->wrk[i];
+		pthread_join(wrk->thread, NULL);
+	}
+	pthread_cond_destroy(&pool->cond);
+
+out_free_mutex:
+	pthread_mutex_destroy(&pool->lock);
+out_free_wrk:
+	free(pool->wrk);
+	return ret;
+}
+
+static void mode_dml_exit(struct worker *wrk)
+{
+	struct mysql_wrk_pool *pool = &wrk->mysql_pool;
+	struct mysql_wrk *wrk_tmp;
+	uint32_t i = pool->nr_wrk;
+
+	pthread_mutex_lock(&pool->lock);
+	g_stop = true;
+	pthread_cond_broadcast(&pool->cond);
+	pthread_mutex_unlock(&pool->lock);
+
+	printf("Waiting for %u mysql worker(s) to exit...\n", i);
+	while (i--) {
+		wrk_tmp = &pool->wrk[i];
+		pthread_join(wrk_tmp->thread, NULL);
+	}
+	pthread_cond_destroy(&pool->cond);
+	pthread_mutex_destroy(&pool->lock);
+	free(pool->wrk);
+}
+
 int main(int argc, char **argv)
 {
 	struct worker worker;
@@ -779,6 +980,8 @@ int main(int argc, char **argv)
 		return -EINVAL;
 	}
 
+	memset(&worker, 0, sizeof(worker));
+
 	if (!strcmp(argv[1], "ddl")) {
 		run_mode = MODE_DDL;
 	} else if (!strcmp(argv[1], "dml")) {
@@ -787,13 +990,25 @@ int main(int argc, char **argv)
 			fprintf(stderr, "Failed to parse mysql env\n");
 			return ret;
 		}
+
+		ret = setup_sigaction();
+		if (ret) {
+			fprintf(stderr, "Failed to setup sigaction\n");
+			return ret;
+		}
+
+		ret = start_mysql_workers(&worker.mysql_pool, NR_MYSQL_WORKERS);
+		if (ret) {
+			fprintf(stderr, "Failed to start mysql workers\n");
+			return ret;
+		}
+
 		run_mode = MODE_DML;
 	} else {
 		fprintf(stderr, "Invalid command: %s\n", argv[1]);
 		return -EINVAL;
 	}
 
-	memset(&worker, 0, sizeof(worker));
 	worker.fp = fopen(argv[2], "rb");
 	if (!worker.fp) {
 		ret = errno;
@@ -802,6 +1017,10 @@ int main(int argc, char **argv)
 	}
 
 	err = worker_func(&worker);
+
+	if (run_mode == MODE_DML)
+		mode_dml_exit(&worker);
+
 	fclose(worker.fp);
 	return -PTR_ERR(err);
 }
