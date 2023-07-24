@@ -706,6 +706,7 @@ static void *worker_func(void *arg)
 		goto out;
 	}
 
+	printf("Total parsed lines: %llu\n", (unsigned long long) wrk->nr_lines);
 	if (run_mode == MODE_DDL)
 		dump_column_heuristic(&wrk->columns);
 
