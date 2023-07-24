@@ -250,6 +250,7 @@ static int parse_columns(char *line, struct dt_columns *col, struct dt_lmarks *l
 		col->nr_cols++;
 		tmp_cols = realloc(col->cols, col->nr_cols * sizeof(*tmp_cols));
 		if (!tmp_cols) {
+			free(tmp);
 			fprintf(stderr, "Failed to allocate columns\n");
 			ret = -ENOMEM;
 			goto out_err;
