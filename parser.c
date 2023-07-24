@@ -95,8 +95,9 @@ struct mysql_wrk_pool {
 
 struct work_data {
 	struct dt_columns	*col;
-	struct dt_rows		*rows;
-	_Atomic(int)		refcnt;
+	struct dt_row		*rows;
+	struct worker		*worker;
+	size_t			nr_rows;
 };
 
 struct worker {
@@ -120,6 +121,10 @@ struct worker {
 	uint64_t		nr_lines;
 
 	struct mysql_wrk_pool	mysql_pool;
+
+	uint32_t		nr_pending_works;
+	pthread_mutex_t		pending_wrk_lock;
+	pthread_cond_t		pending_wrk_cond;
 };
 
 struct mysql_cred {
@@ -583,12 +588,115 @@ static int column_exec_heuristic(struct dt_columns *col, struct dt_rows *rows)
 	return column_detect_heuristic_rows(col, rows);
 }
 
-static int flush_rows(struct dt_columns *col, struct dt_rows *rows)
+static struct mysql_wrk *get_mysql_worker(struct mysql_wrk_pool *pool)
+{
+	struct mysql_wrk *wrk;
+	uint32_t i;
+
+	for (i = 0; i < pool->nr_wrk; i++) {
+		wrk = &pool->wrk[i];
+		if (!wrk->is_used) {
+			wrk->is_used = true;
+			return wrk;
+		}
+	}
+
+	return NULL;
+}
+
+static void post_db_work_callback(struct mysql_wrk *wrk, void *arg)
+{
+	struct work_data *wd = arg;
+	struct worker *main_wrk = wd->worker;
+
+
+	pthread_mutex_lock(&main_wrk->pending_wrk_lock);
+	if (--main_wrk->nr_pending_works == 0)
+		pthread_cond_signal(&main_wrk->pending_wrk_cond);
+	pthread_mutex_unlock(&main_wrk->pending_wrk_lock);
+	free(wd);
+}
+
+static int post_db_work(struct worker *wrk, struct work_data *wd)
+{
+	struct mysql_wrk_pool *pool = &wrk->mysql_pool;
+	struct mysql_wrk *wrk_tmp;
+	int ret;
+
+	pthread_mutex_lock(&pool->lock);
+	wrk_tmp = get_mysql_worker(pool);
+	if (!wrk_tmp) {
+		pthread_mutex_unlock(&pool->lock);
+		return -EAGAIN;
+	}
+
+	wrk_tmp->is_used = true;
+	wrk_tmp->arg = wd;
+	wrk_tmp->cb = &post_db_work_callback;
+	pthread_cond_broadcast(&pool->cond);
+	pthread_mutex_unlock(&pool->lock);
+	return 0;
+}
+
+static int insert_to_db(struct worker *wrk, struct dt_columns *col, struct dt_rows *rows)
+{
+	size_t nr_workers = wrk->mysql_pool.nr_wrk;
+	size_t nr_rows = rows->nr_rows;
+	struct timespec ts;
+	size_t i;
+	int ret = 0;
+
+	pthread_mutex_lock(&wrk->pending_wrk_lock);
+	for (i = 0; i < nr_workers; i++) {
+		struct work_data *wd;
+
+		wd = malloc(sizeof(*wd));
+		if (!wd) {
+			fprintf(stderr, "Failed to allocate work data\n");
+			ret = -ENOMEM;
+			break;
+		}
+
+		wd->worker = wrk;
+		wd->col = col;
+		wd->rows = &rows->rows[i * nr_rows / nr_workers];
+		if (i == nr_workers - 1)
+			wd->nr_rows = nr_rows - (i * nr_rows / nr_workers);
+		else
+			wd->nr_rows = nr_rows / nr_workers;
+
+		printf("Posting work %zu: %zu rows\n", i, wd->nr_rows);
+		post_db_work(wrk, wd);
+	}
+	wrk->nr_pending_works += (uint32_t) i;
+
+	while (wrk->nr_pending_works) {
+		printf("Waiting for %u pending works\n", wrk->nr_pending_works);
+
+		clock_gettime(CLOCK_REALTIME, &ts);
+		ts.tv_sec += 1;
+		pthread_cond_timedwait(&wrk->pending_wrk_cond, &wrk->pending_wrk_lock, &ts);
+
+		if (g_stop) {
+			ret = -EINTR;
+			break;
+		}
+	}
+	printf("Continue parsing...\n");
+	pthread_mutex_unlock(&wrk->pending_wrk_lock);
+
+	return ret;
+}
+
+static int flush_rows(struct worker *wrk, struct dt_columns *col, struct dt_rows *rows)
 {
 	int ret = 0;
 
 	if (run_mode == MODE_DDL)
 		ret = column_exec_heuristic(col, rows);
+
+	if (run_mode == MODE_DML)
+		ret = insert_to_db(wrk, col, rows);
 
 	free_dt_rows(rows);
 	return ret;
@@ -719,9 +827,9 @@ static void *worker_func(void *arg)
 		/*
 		 * Don't let the buffer grow too big.
 		 */
-		if (wrk->nr_lines % 262144 == 0) {
+		if (wrk->nr_lines % 524288 == 0) {
 			printf("Parsed %llu lines\n", (unsigned long long) wrk->nr_lines);
-			err = flush_rows(&wrk->columns, &wrk->rows);
+			err = flush_rows(wrk, &wrk->columns, &wrk->rows);
 			if (err) {
 				ret = ERR_PTR(err);
 				goto out;
@@ -729,7 +837,7 @@ static void *worker_func(void *arg)
 		}
 	}
 
-	err = flush_rows(&wrk->columns, &wrk->rows);
+	err = flush_rows(wrk, &wrk->columns, &wrk->rows);
 	if (err) {
 		ret = ERR_PTR(err);
 		goto out;
@@ -825,7 +933,9 @@ static void *sql_worker_func(void *arg)
 	struct mysql_wrk_pool *pool = wrk->pool;
 	int ret;
 
+	pthread_mutex_lock(&pool->lock);
 	ret = sql_worker_thread_init(wrk);
+	pthread_mutex_unlock(&pool->lock);
 	if (ret) {
 		g_stop = true;
 		return NULL;
@@ -833,8 +943,8 @@ static void *sql_worker_func(void *arg)
 
 	atomic_fetch_add(&pool->nr_ready_wrk, 1);
 	printf("MySQL worker %04u is ready\n", wrk->tid);
-	pthread_mutex_lock(&pool->lock);
 
+	pthread_mutex_lock(&pool->lock);
 	while (!g_stop) {
 		if (!wrk->is_used) {
 			pthread_cond_wait(&pool->cond, &pool->lock);
@@ -994,6 +1104,19 @@ int main(int argc, char **argv)
 		ret = setup_sigaction();
 		if (ret) {
 			fprintf(stderr, "Failed to setup sigaction\n");
+			return ret;
+		}
+
+		ret = pthread_mutex_init(&worker.pending_wrk_lock, NULL);
+		if (ret) {
+			fprintf(stderr, "Failed to initialize pending work mutex: %s\n", strerror(ret));
+			return ret;
+		}
+
+		ret = pthread_cond_init(&worker.pending_wrk_cond, NULL);
+		if (ret) {
+			pthread_mutex_destroy(&worker.pending_wrk_lock);
+			fprintf(stderr, "Failed to initialize pending work cond: %s\n", strerror(ret));
 			return ret;
 		}
 
