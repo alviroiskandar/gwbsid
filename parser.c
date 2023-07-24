@@ -36,7 +36,6 @@ enum {
 	T_DATE      = 3,
 	T_DATETIME  = 4,
 	T_VARCHAR   = 5,
-	T_TEXT      = 6,
 };
 
 enum {
