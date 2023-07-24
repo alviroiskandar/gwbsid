@@ -29,6 +29,7 @@
 struct dt_lmarks {
 	uint32_t	*marks;
 	size_t		nr_marks;
+	uint32_t	min_line_len;
 };
 
 enum {
@@ -242,6 +243,7 @@ static void *trim_ws(char *str)
 static int parse_lmarks(char *line, struct dt_lmarks *lmarks)
 {
 	char *head, *tail;
+	size_t i;
 	int err;
 
 	head = tail = line;
@@ -278,6 +280,10 @@ static int parse_lmarks(char *line, struct dt_lmarks *lmarks)
 		head = ++tail;
 	}
 
+	lmarks->min_line_len = 0;
+	for (i = 0; i < (lmarks->nr_marks - 1); i++)
+		lmarks->min_line_len += lmarks->marks[i] + 1;
+
 	return 0;
 
 out_err:
@@ -289,6 +295,11 @@ static int parse_columns(char *line, struct dt_columns *col, struct dt_lmarks *l
 {
 	int ret = 0;
 	size_t i;
+
+	if (strlen(line) < lmarks->min_line_len) {
+		fprintf(stderr, "Column line is too short\n");
+		return -EAGAIN;
+	}
 
 	for (i = 0; i < lmarks->nr_marks; i++) {
 		char *tmp, **tmp_cols;
@@ -342,6 +353,9 @@ static int parse_row(char *line, struct dt_rows *rows, struct dt_lmarks *lmarks)
 	struct dt_row *row;
 	int ret = 0;
 	size_t i;
+
+	if (strlen(line) < lmarks->min_line_len)
+		return -EISNAM;
 
 	if (rows->nr_rows >= rows->nr_alloc) {
 		ret = scale_up_dt_rows(rows);
@@ -1063,6 +1077,12 @@ static void *worker_func(void *arg)
 
 		wrk->nr_lines++;
 		err = parse_row(line, &wrk->rows, &wrk->lmarks);
+		if (err == -EISNAM) {
+			fprintf(stderr, "Skipping line %llu, the row is too short\n",
+				(unsigned long long) wrk->nr_lines);
+			err = 0;
+			continue;
+		}
 		if (err == -EAGAIN)
 			break;
 
