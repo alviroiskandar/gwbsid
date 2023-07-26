@@ -1344,6 +1344,8 @@ static int http_res_add_hdr(struct client *cl, const char *key, const char *val,
 	nr_fields = hdr->nr_fields + 1u;
 	fields = realloc(hdr->fields, nr_fields * sizeof(*fields));
 	if (!fields) {
+		free(vkey);
+		free(vval);
 		free(hdr->fields);
 		hdr->fields = NULL;
 		return -ENOMEM;
