@@ -966,7 +966,6 @@ static int do_accept(int tcp_fd, struct sockaddr_storage *ss, socklen_t *len,
 {
 	int err, fd;
 
-	memset(ss, 0, sizeof(*ss));
 	fd = accept4(tcp_fd, (struct sockaddr *)ss, len, SOCK_NONBLOCK);
 	if (fd >= 0) {
 		*got_client = true;
