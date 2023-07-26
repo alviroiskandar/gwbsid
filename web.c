@@ -1721,8 +1721,10 @@ int http_construct_hdr_buf(struct client *cl)
 	char *buf;
 	int tmp;
 
-	len = (size_t)snprintf(NULL, 0, "HTTP/1.1 %d %s\r\n", res->header.code,
-			       http_code_to_str(res->header.code));
+	len = (size_t)snprintf(NULL, 0,
+		"HTTP/1.1 %d %s\r\n"
+		"Connection: close\r\n",
+		res->header.code, http_code_to_str(res->header.code));
 	for (i = 0; i < res->header.nr_fields; i++) {
 		len += strlen(res->header.fields[i].key);
 		len += strlen(res->header.fields[i].val);
@@ -1736,8 +1738,11 @@ int http_construct_hdr_buf(struct client *cl)
 		return -ENOMEM;
 
 	res->hdr_buf = buf;
-	tmp = snprintf(buf, len, "HTTP/1.1 %d %s\r\n", res->header.code,
-		       http_code_to_str(res->header.code));
+	tmp = snprintf(buf, len,
+			"HTTP/1.1 %d %s\r\n"
+			"Connection: close\r\n",
+			res->header.code,
+			http_code_to_str(res->header.code));
 	len -= tmp;
 	buf += tmp;
 
@@ -1854,10 +1859,8 @@ static int send_res_body_fd(struct worker *wrk, struct client *cl)
 		return ret;
 	}
 
-	if (ret == 0) {
-		wrk->kill_current = true;
-		return 0;
-	}
+	if (ret == 0)
+		return -ECONNRESET;
 
 	ret = do_send(cl, buf, (size_t)ret);
 	if (ret < 0)
@@ -1867,8 +1870,7 @@ static int send_res_body_fd(struct worker *wrk, struct client *cl)
 	if (cl->res.body.off < (uint64_t)cl->res.body.st.st_size)
 		return http_wrk_reg_pollout(wrk, cl);
 
-	wrk->kill_current = true;
-	return 0;
+	return -ECONNRESET;
 }
 
 static int http_send_response_body(struct worker *wrk, struct client *cl)
@@ -2088,7 +2090,7 @@ static char *construct_query_get_user(struct mysql_conn *conn, const char *name,
 			return NULL;
 
 		mysql_real_escape_string(conn->mysql, tmp, name, len);
-		ret = asprintf(&q, "SELECT * FROM users WHERE _id >= %lld AND Nama_Rekening LIKE	 '%s%%' LIMIT %lld",
+		ret = asprintf(&q, "SELECT * FROM users WHERE _id >= %lld AND Nama_Rekening LIKE '%s%%' LIMIT %lld",
 		               (long long)start_id, tmp, (long long)limit);
 		free(tmp);
 	} else {
@@ -2099,6 +2101,7 @@ static char *construct_query_get_user(struct mysql_conn *conn, const char *name,
 	if (ret < 0)
 		return NULL;
 
+	printf("q = %s\n", q);
 	return q;
 }
 
@@ -2207,6 +2210,7 @@ static void gwbsid_get_user(void *argx)
 	int64_t offset = 0;
 	size_t len;
 	char *res;
+	int ret;
 
 	if (arg->offset) {
 		offset = strtoll(arg->offset, NULL, 10);
@@ -2234,18 +2238,31 @@ static void gwbsid_get_user(void *argx)
 	}
 
 	if (client_get_refcnt(arg->cl) == 1) {
-		destroy_json_query_result(res);
 		printf("Client %s is gone, not sending response\n",
 			get_str_ss(&arg->cl->addr));
-		return;
+		goto out;
 	}
 
 	len = strlen(res);
 	http_res_code(arg->cl, 200);
-	http_res_add_hdr(arg->cl, "Content-Type", "application/json");
-	http_res_add_hdr(arg->cl, "Content-Length", "%zu", len);
-	http_res_add_body(arg->cl, res);
-	http_res_commit(arg->wrk, arg->cl);
+	ret = http_res_add_body(arg->cl, res);
+	if (ret)
+		goto out;
+
+	ret |= http_res_add_hdr(arg->cl, "Content-Type", "application/json");
+	ret |= http_res_add_hdr(arg->cl, "Content-Length", "%zu", len);
+	if (ret)
+		goto out;
+
+	ret = http_res_commit(arg->wrk, arg->cl);
+	if (ret == 0) {
+		notify_worker(arg->wrk);
+	} else {
+		put_client_slot(arg->wrk, arg->cl);
+		arg->cl = NULL;
+	}
+
+out:
 	destroy_json_query_result(res);
 }
 
@@ -2256,8 +2273,11 @@ static void gwbsid_free_get_user(void *arg)
 	if (a->conn && !IS_ERR(a->conn))
 		put_mysql_conn(a->wrk, a->conn);
 
-	put_client_slot(a->wrk, a->cl);
+	if (a->cl)
+		put_client_slot(a->wrk, a->cl);
+
 	free(a->offset);
+	free(a->limit);
 	free(a->name);
 	free(a);
 }
