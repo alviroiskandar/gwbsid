@@ -144,6 +144,7 @@ struct worker {
 	int			timeout;
 	uint64_t		event_fd_val;
 	bool			kill_current;
+	volatile bool		is_sleeping;
 	struct context		*ctx;
 	struct client_slot	client_slot;
 	pthread_t		thread;
@@ -1176,12 +1177,26 @@ static struct worker *pick_best_worker(struct context *ctx)
 	return &ctx->workers[0];
 }
 
+static int notify_worker(struct worker *wrk)
+{
+	uint64_t val = 1;
+	ssize_t wr_ret;
+	int ret;
+
+	wr_ret = write(wrk->event_fd, &val, sizeof(val));
+	if (wr_ret < 0) {
+		ret = -errno;
+		perror("write() in install_client_to_worker()");
+		return ret;
+	}
+
+	return 0;
+}
+
 static int install_client_to_worker(struct worker *wrk, struct worker *target_wrk,
 				    struct client *cl)
 {
 	struct epoll_event ev;
-	uint64_t val = 1;
-	ssize_t wr_ret;
 	int ret;
 
 	ev.events = EPOLLIN | EPOLLPRI;
@@ -1196,14 +1211,7 @@ static int install_client_to_worker(struct worker *wrk, struct worker *target_wr
 	if (wrk == target_wrk)
 		return 0;
 
-	wr_ret = write(target_wrk->event_fd, &val, sizeof(val));
-	if (wr_ret < 0) {
-		ret = -errno;
-		perror("write() in install_client_to_worker()");
-		return ret;
-	}
-
-	return 0;
+	return notify_worker(target_wrk);
 }
 
 static int accept_tcp_client(struct worker *wrk, int fd, struct sockaddr_storage *addr)
