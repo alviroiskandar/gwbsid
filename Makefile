@@ -1,7 +1,7 @@
 
 CC ?= cc
-CFLAGS = -Wall -Wextra -O2 -ggdb3
-LDLIBS = -lpthread -lmysqlclient
+CFLAGS = -Wall -Wextra -O2 -ggdb3 -fsanitize=address
+LDLIBS = -lpthread -lmysqlclient -ljson-c
 
 all: parser web
 

@@ -11,6 +11,7 @@
 #define _POSIX_C_SOURCE	200809L
 #endif
 
+#include <json-c/json.h>
 #include <mysql/mysql.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +34,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <limits.h>
 
 #define TCP_LISTEN_BACKLOG	1024
 #define MYSQL_POOL_SIZE		128
@@ -40,7 +42,8 @@
 #define NR_WORK_ITEMS		1024
 #define NR_EPOLL_EVENTS		32
 #define NR_CLIENTS		1024
-#define NR_FORK_WORKERS		4
+#define NR_FORK_WORKERS		2
+#define NR_IO_WORKERS		32
 #define ARRAY_SIZE(X)		(sizeof(X) / sizeof((X)[0]))
 
 enum {
@@ -120,6 +123,7 @@ struct client {
 	int			fd;
 	struct sockaddr_storage	addr;
 	char			*buf;
+	struct mysql_conn	*db_conn;
 	struct http_req_header	header;
 	struct http_response	res;
 	uint32_t		buf_len;
@@ -163,12 +167,20 @@ struct work_queue {
 	uint32_t		tail;
 };
 
+struct io_worker {
+	pthread_t		thread;
+	struct context		*ctx;
+	uint32_t		id;
+};
+
 struct context {
 	volatile bool		stop;
 	int			tcp_fd;
 	struct mysql_pool	mysql_pool;
 	struct worker		*workers;
 	struct work_queue	work_queue;
+	struct io_worker	*io_workers;
+	uint32_t		nr_io_workers;
 	uint32_t		nr_workers;
 	struct tcp_bind_cfg	tcp_bind_cfg;
 	struct mysql_cred	mysql_cred;
@@ -599,6 +611,164 @@ static int pop_work_queue(struct work_queue *queue, struct work_item *item)
 	return ret;
 }
 
+static void set_thread_name(pthread_t t, const char *fmt, ...)
+{
+	char name[TASK_COMM_LEN];
+	va_list ap;
+
+	va_start(ap, fmt);
+	vsnprintf(name, sizeof(name), fmt, ap);
+	va_end(ap);
+
+	pthread_setname_np(t, name);
+}
+
+static void *run_io_worker(void *arg)
+{
+	struct io_worker *worker = arg;
+	struct context *ctx = worker->ctx;
+	struct work_queue *wq = &ctx->work_queue;
+	int ret;
+
+	pthread_mutex_lock(&wq->lock);
+	while (!ctx->stop) {
+		struct work_item item;
+
+		ret = __pop_work_queue(wq, &item);
+		if (ret < 0) {
+			pthread_cond_wait(&wq->cond, &wq->lock);
+			continue;
+		}
+
+		pthread_mutex_unlock(&wq->lock);
+
+		if (item.callback)
+			item.callback(item.data);
+
+		if (item.free)
+			item.free(item.data);
+
+		pthread_mutex_lock(&wq->lock);
+	}
+	pthread_mutex_unlock(&wq->lock);
+
+	return NULL;
+}
+
+static int init_io_workers(struct context *ctx)
+{
+	struct io_worker *workers;
+	uint32_t i;
+	int ret;
+
+	ctx->nr_io_workers = NR_IO_WORKERS;
+	workers = calloc(ctx->nr_io_workers, sizeof(*workers));
+	if (!workers) {
+		errno = ENOMEM;
+		perror("calloc() in init_io_workers()");
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < ctx->nr_io_workers; i++) {
+		workers[i].id = i;
+		workers[i].ctx = ctx;
+		ret = pthread_create(&workers[i].thread, NULL, run_io_worker, &workers[i]);
+		if (ret) {
+			errno = ret;
+			perror("pthread_create() in init_io_workers()");
+			goto out_err;
+		}
+
+		set_thread_name(workers[i].thread, "io-wrk-%u", i);
+	}
+
+	ctx->io_workers = workers;
+	return 0;
+
+out_err:
+	pthread_mutex_lock(&ctx->work_queue.lock);
+	ctx->stop = true;
+	pthread_cond_broadcast(&ctx->work_queue.cond);
+	pthread_mutex_unlock(&ctx->work_queue.lock);
+
+	while (i--) {
+		pthread_kill(workers[i].thread, SIGTERM);
+		pthread_join(workers[i].thread, NULL);
+	}
+	free(workers);
+	return -ret;
+}
+
+static int do_mysql_connect(struct worker *wrk, struct mysql_conn *conn)
+{
+	conn->mysql = mysql_init(NULL);
+	if (!conn->mysql) {
+		fprintf(stderr, "Warning: mysql_init() failed in do_mysql_connect() (wrk=%u)\n",
+			wrk->id);
+		return -ENOMEM;
+	}
+
+	if (!mysql_real_connect(conn->mysql, wrk->ctx->mysql_cred.host,
+				wrk->ctx->mysql_cred.user,
+				wrk->ctx->mysql_cred.pass,
+				wrk->ctx->mysql_cred.db,
+				wrk->ctx->mysql_cred.port,
+				NULL, 0)) {
+		fprintf(stderr, "Warning: mysql_real_connect() failed in do_mysql_connect() (wrk=%u)\n",
+			wrk->id);
+		mysql_close(conn->mysql);
+		conn->mysql = NULL;
+		return -EIO;
+	}
+
+	conn->is_connected = true;
+	return 0;
+}
+
+static void put_mysql_conn(struct worker *wrk, struct mysql_conn *conn)
+{
+	struct mysql_pool *pool = &wrk->ctx->mysql_pool;
+	int err;
+
+	assert(conn->is_used);
+
+	mysql_close(conn->mysql);
+	conn->mysql = NULL;
+	conn->is_connected = false;
+	conn->is_used = false;
+	err = push_stack(&pool->stack, conn - pool->conn_arr);
+	if (err) {
+		fprintf(stderr, "Warning: push_stack() failed in put_mysql_conn() (wrk=%u)\n",
+			wrk->id);
+	}
+}
+
+static struct mysql_conn *get_mysql_conn(struct worker *wrk)
+{
+	struct mysql_pool *pool = &wrk->ctx->mysql_pool;
+	struct mysql_conn *conn;
+	uint32_t idx;
+	int err;
+
+	err = pop_stack(&pool->stack, &idx);
+	if (err)
+		return ERR_PTR(-EAGAIN);
+
+	conn = &pool->conn_arr[idx];
+	assert(!conn->is_used);
+	conn->is_used = true;
+
+	if (!conn->is_connected) {
+		err = do_mysql_connect(wrk, conn);
+		if (err) {
+			put_mysql_conn(wrk, conn);
+			return ERR_PTR(err);
+		}
+	}
+
+	return conn;
+}
+
 static int init_work_queue(struct context *ctx)
 {
 	static const uint32_t nr_items = NR_WORK_ITEMS;
@@ -835,6 +1005,11 @@ static void put_client_slot(struct worker *wrk, struct client *client)
 {
 	int err;
 
+	if (client->db_conn) {
+		put_mysql_conn(wrk, client->db_conn);
+		client->db_conn = NULL;
+	}
+
 	reset_client(client);
 	err = push_stack(&wrk->client_slot.stack, client->id);
 	if (err) {
@@ -869,14 +1044,6 @@ static struct client *get_client_slot(struct worker *wrk)
 	}
 
 	return ret;
-}
-
-static void set_worker_name(struct worker *wrk)
-{
-	char name[TASK_COMM_LEN];
-
-	snprintf(name, sizeof(name), "ewrk-%u", wrk->id);
-	pthread_setname_np(wrk->thread, name);
 }
 
 static int init_workers(struct context *ctx)
@@ -922,7 +1089,7 @@ static int init_workers(struct context *ctx)
 			goto out_err;
 		}
 
-		set_worker_name(&wrk[i]);
+		set_thread_name(wrk[i].thread, "ewrk-%u", i);
 	}
 
 	ctx->workers = wrk;
@@ -953,7 +1120,7 @@ static int poll_events(struct worker *wrk)
 	struct epoll_event *ev = wrk->events;
 	int nr;
 
-	nr = epoll_wait(wrk->epoll_fd, ev, wrk->nr_events, -1);
+	nr = epoll_wait(wrk->epoll_fd, ev, wrk->nr_events, wrk->timeout);
 	if (nr < 0) {
 		if (errno == EINTR)
 			return 0;
@@ -1293,6 +1460,48 @@ static int parse_http_header_fields(struct client *cl, char **next)
 	return 0;
 }
 
+static int htoi(char *s)
+{
+	int value;
+	int c;
+
+	c = ((unsigned char *)s)[0];
+	if (isupper(c))
+		c = tolower(c);
+	value = (c >= '0' && c <= '9' ? c - '0' : c - 'a' + 10) * 16;
+
+	c = ((unsigned char *)s)[1];
+	if (isupper(c))
+		c = tolower(c);
+	value += c >= '0' && c <= '9' ? c - '0' : c - 'a' + 10;
+
+	return (value);
+}
+
+static size_t url_decode(char *str, size_t len)
+{
+	char *dest = str;
+	char *data = str;
+
+	while (len--) {
+		if (*data == '+') {
+			*dest = ' ';
+		} else if (*data == '%' && len >= 2 &&
+			   isxdigit((int) *(data + 1)) &&
+			   isxdigit((int) *(data + 2))) {
+			*dest = (char) htoi(data + 1);
+			data += 2;
+			len -= 2;
+		} else {
+			*dest = *data;
+		}
+		data++;
+		dest++;
+	}
+	*dest = '\0';
+	return dest - str;
+}
+
 static int parse_http_headers(struct client *cl)
 {
 	uint32_t len = cl->buf_len;
@@ -1358,13 +1567,13 @@ static int http_res_add_hdr(struct client *cl, const char *key, const char *val,
 	return 0;
 }
 
-static int http_res_add_body_file(struct client *cl, const char *body)
+static int http_res_add_body_file(struct client *cl, const char *file)
 {
 	struct http_response *res = &cl->res;
 	struct http_res_body *res_body = &res->body;
 	int fd, ret;
 
-	fd = open(body, O_RDONLY);
+	fd = open(file, O_RDONLY);
 	if (fd < 0) {
 		ret = -errno;
 		perror("open() in http_res_add_body_file()");
@@ -1377,6 +1586,12 @@ static int http_res_add_body_file(struct client *cl, const char *body)
 		perror("fstat() in http_res_add_body_file()");
 		close(fd);
 		return ret;
+	}
+
+	// Don't allow non-regular files.
+	if (!S_ISREG(res_body->st.st_mode)) {
+		close(fd);
+		return -EINVAL;
 	}
 
 	res_body->fd = fd;
@@ -1619,24 +1834,6 @@ static int http_res_commit(struct worker *wrk, struct client *cl)
 	return http_queue_response(wrk, cl);
 }
 
-static int http_route_index(struct worker *wrk, struct client *cl)
-{
-	int ret;
-
-	http_res_code(cl, 200);
-	ret = http_res_add_body_file(cl, "web_data/views/index.html");
-	if (ret < 0)
-		return ret;
-
-	ret |= http_res_add_hdr(cl, "Content-Type", "text/html");
-	ret |= http_res_add_hdr(cl, "Content-Length", "%llu",
-				(unsigned long long)cl->res.body.st.st_size);
-	if (ret)
-		return -ENOMEM;
-
-	return http_res_commit(wrk, cl);
-}
-
 static int http_route_404(struct worker *wrk, struct client *cl)
 {
 	int ret = 0;
@@ -1651,10 +1848,167 @@ static int http_route_404(struct worker *wrk, struct client *cl)
 	return http_res_commit(wrk, cl);
 }
 
+static int http_route_index(struct worker *wrk, struct client *cl)
+{
+	unsigned long long len;
+	int ret;
+
+	http_res_code(cl, 200);
+	ret = http_res_add_body_file(cl, "web_data/views/index.html");
+	if (ret < 0)
+		return ret;
+
+	len = (unsigned long long)cl->res.body.st.st_size;
+	ret |= http_res_add_hdr(cl, "Content-Type", "text/html");
+	ret |= http_res_add_hdr(cl, "Content-Length", "%llu", len);
+	if (ret)
+		return -ENOMEM;
+
+	return http_res_commit(wrk, cl);
+}
+
+static const char *get_file_mime_by_ext(const char *fname)
+{
+	char path[PATH_MAX];
+	char *base;
+	char *last;
+	char *ptr;
+
+	path[sizeof(path) - 1] = '\0';
+	strncpy(path, fname, sizeof(path));
+	path[strlen(fname)] = '\0';
+	base = basename(path);
+	ptr = strrchr(base, '.');
+	if (!ptr)
+		goto out;
+
+	last = ptr;
+	while (1) {
+		ptr = strchr(ptr + 1, '.');
+		if (!ptr)
+			break;
+
+		last = ptr;
+	}
+
+	last = strtolower(last);
+	if (!strcmp(last, ".html") || !strcmp(last, ".htm"))
+		return "text/html";
+
+	if (!strcmp(last, ".css"))
+		return "text/css";
+
+	if (!strcmp(last, ".js"))
+		return "application/javascript";
+
+	if (!strcmp(last, ".png"))
+		return "image/png";
+
+	if (!strcmp(last, ".jpg") || !strcmp(last, ".jpeg"))
+		return "image/jpeg";
+
+	if (!strcmp(last, ".gif"))
+		return "image/gif";
+
+	if (!strcmp(last, ".ico"))
+		return "image/x-icon";
+
+out:
+	return "application/octet-stream";
+}
+
+static int http_route_static(struct worker *wrk, struct client *cl)
+{
+	unsigned long long len;
+	const char *mime;
+	char path[2048];
+	int ret;
+
+	if (strstr(cl->header.uri, ".."))
+		return http_route_404(wrk, cl);
+
+	snprintf(path, sizeof(path), "web_data%s", cl->header.uri);
+	ret = http_res_add_body_file(cl, path);
+	if (ret < 0)
+		return http_route_404(wrk, cl);
+
+	mime = get_file_mime_by_ext(path);
+
+	http_res_code(cl, 200);
+	len = (unsigned long long)cl->res.body.st.st_size;
+	ret |= http_res_add_hdr(cl, "Content-Type", mime);
+	ret |= http_res_add_hdr(cl, "Content-Length", "%llu", len);
+	if (ret)
+		return -ENOMEM;
+
+	return http_res_commit(wrk, cl);
+}
+
+static char *get_qs_val(const char *key, const char *qsq)
+{
+	char *ret = NULL;
+	char *buf;
+	char *pos;
+	char *qs;
+	int len;
+
+	qs = strdup(qsq);
+	if (!qs)
+		return NULL;
+
+	buf = malloc(strlen(key) + 2u);
+	if (!buf)
+		return NULL;
+
+	len = snprintf(buf, strlen(key) + 2u, "%s=", key);
+	pos = strstr(qs, buf);
+	if (!pos)
+		goto out;
+	if (pos != qs && pos[-1] != '&')
+		goto out;
+
+	ret = pos + len;
+	pos = strchr(ret, '&');
+	if (pos)
+		pos[0] = '\0';
+
+	ret = strdup(ret);
+	if (!ret)
+		goto out;
+
+	url_decode(ret, strlen(ret));
+out:
+	free(buf);
+	free(qs);
+	return ret;
+}
+
+static int http_route_gwbsid_api_v1(struct worker *wrk, struct client *cl)
+{
+	char *offset;
+	char *name;
+
+	offset = get_qs_val("offset", cl->header.qs);
+	name = get_qs_val("name", cl->header.qs);
+
+	printf("offset = %s\n", offset);
+	printf("name = %s\n", name);
+
+	free(offset);
+	free(name);
+	return http_route_404(wrk, cl);
+}
+
 static int exec_http_router(struct worker *wrk, struct client *cl)
 {
 	if (!strcmp(cl->header.uri, "/"))
 		return http_route_index(wrk, cl);
+
+	if (!strncmp(cl->header.uri, "/assets/", 8))
+		return http_route_static(wrk, cl);
+
+	if (!strncmp(cl->header.uri, "/gwbsid/api/v1/", 15))
+		return http_route_gwbsid_api_v1(wrk, cl);
 
 	return http_route_404(wrk, cl);
 }
@@ -1792,13 +2146,9 @@ static void destroy_workers(struct context *ctx)
 	if (!ctx->workers)
 		return;
 
-	pthread_mutex_lock(&ctx->work_queue.lock);
-	pthread_cond_broadcast(&ctx->work_queue.cond);
-	pthread_mutex_unlock(&ctx->work_queue.lock);
-
 	for (i = 0; i < ctx->nr_workers; i++) {
 		wrk = &ctx->workers[i];
-		printf("Destroying worker %u...\n", i);
+		printf("Destroying TCP worker %u...\n", i);
 
 		/*
 		 * The first thread is the main thread.
@@ -1822,10 +2172,34 @@ static void destroy_workers(struct context *ctx)
 	assert(atomic_load(&ctx->online_workers) == 0);
 }
 
+static void destroy_io_workers(struct context *ctx)
+{
+	struct io_worker *wrk;
+	uint32_t i;
+
+	if (!ctx->io_workers)
+		return;
+
+	pthread_mutex_lock(&ctx->work_queue.lock);
+	pthread_cond_broadcast(&ctx->work_queue.cond);
+	pthread_mutex_unlock(&ctx->work_queue.lock);
+
+	printf("Destroying %u IO worker(s)...\n", ctx->nr_io_workers);
+	for (i = 0; i < ctx->nr_io_workers; i++) {
+		wrk = &ctx->io_workers[i];
+		pthread_kill(wrk->thread, SIGTERM);
+		pthread_join(wrk->thread, NULL);
+	}
+
+	free(ctx->io_workers);
+	ctx->io_workers = NULL;
+}
+
 static void destroy_context(struct context *ctx)
 {
 	ctx->stop = true;
 	destroy_workers(ctx);
+	destroy_io_workers(ctx);
 	destroy_work_queue(ctx);
 	destroy_mysql_pool(ctx);
 	destroy_tcp_socket(ctx);
@@ -1852,6 +2226,10 @@ static int run_web_server(struct context *ctx)
 		goto out;
 
 	ret = init_work_queue(ctx);
+	if (ret)
+		goto out;
+
+	ret = init_io_workers(ctx);
 	if (ret)
 		goto out;
 
