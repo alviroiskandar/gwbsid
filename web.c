@@ -42,7 +42,7 @@
 #define NR_WORK_ITEMS		1024
 #define NR_EPOLL_EVENTS		32
 #define NR_CLIENTS		1024
-#define NR_FORK_WORKERS		2
+#define NR_FORK_WORKERS		1
 #define NR_IO_WORKERS		32
 #define ARRAY_SIZE(X)		(sizeof(X) / sizeof((X)[0]))
 
@@ -130,7 +130,9 @@ struct client {
 	uint32_t		buf_size;
 	uint32_t		id;
 	struct timespec		last_active;
+	struct cancel_point	*cancel;
 	bool			pollout;
+	_Atomic(int)		refcnt;
 };
 
 struct client_slot {
@@ -190,6 +192,7 @@ struct context {
 
 static struct context *g_ctx;
 
+
 static inline void *ERR_PTR(long err)
 {
 	return (void *)err;
@@ -243,6 +246,21 @@ err:
 	ret = errno;
 	perror("sigaction");
 	return -ret;
+}
+
+static int client_sub_refcnt(struct client *client, int sub)
+{
+	return atomic_fetch_sub(&client->refcnt, sub);
+}
+
+static int client_add_refcnt(struct client *client, int add)
+{
+	return atomic_fetch_add(&client->refcnt, add);
+}
+
+static int client_get_refcnt(struct client *client)
+{
+	return atomic_load(&client->refcnt);
 }
 
 static int parse_mysql_env(struct mysql_cred *cred)
@@ -572,7 +590,7 @@ static int __push_work_queue(struct work_queue *queue, struct work_item *item)
 
 	tail = queue->tail;
 	if ((tail - queue->head) >= queue->mask)
-		return -EOVERFLOW;
+		return -EAGAIN;
 
 	queue->items[tail & queue->mask] = *item;
 	queue->tail = tail + 1;
@@ -582,12 +600,17 @@ static int __push_work_queue(struct work_queue *queue, struct work_item *item)
 static int __pop_work_queue(struct work_queue *queue, struct work_item *item)
 {
 	uint32_t head;
+	uint32_t idx;
 
 	head = queue->head;
 	if (head == queue->tail)
-		return -ENOENT;
+		return -EAGAIN;
 
-	*item = queue->items[head & queue->mask];
+	idx = head & queue->mask;
+	*item = queue->items[idx];
+	queue->items[idx].callback = NULL;
+	queue->items[idx].data = NULL;
+	queue->items[idx].free = NULL;
 	queue->head = head + 1;
 	return 0;
 }
@@ -599,6 +622,7 @@ static int push_work_queue(struct work_queue *queue, struct work_item *item)
 	pthread_mutex_lock(&queue->lock);
 	ret = __push_work_queue(queue, item);
 	pthread_mutex_unlock(&queue->lock);
+	pthread_cond_signal(&queue->cond);
 	return ret;
 }
 
@@ -610,6 +634,18 @@ static int pop_work_queue(struct work_queue *queue, struct work_item *item)
 	ret = __pop_work_queue(queue, item);
 	pthread_mutex_unlock(&queue->lock);
 	return ret;
+}
+
+static int schedule_work(struct worker *wrk, void (*callback)(void *arg),
+			 void *arg, void (*free_func)(void *arg))
+{
+	struct work_item item = {
+		.callback = callback,
+		.data = arg,
+		.free = free_func,
+	};
+
+	return push_work_queue(&wrk->ctx->work_queue, &item);
 }
 
 static void set_thread_name(pthread_t t, const char *fmt, ...)
@@ -816,13 +852,22 @@ static int init_work_queue(struct context *ctx)
 static void destroy_work_queue(struct context *ctx)
 {
 	struct work_queue *queue = &ctx->work_queue;
+	size_t i;
 
-	if (queue->items) {
-		free(queue->items);
-		pthread_mutex_destroy(&queue->lock);
-		pthread_cond_destroy(&queue->cond);
-		memset(queue, 0, sizeof(*queue));
+	if (!queue->items)
+		return;
+
+	for (i = 0; i <= queue->mask; i++) {
+		struct work_item *item = &queue->items[i];
+
+		if (item->free)
+			item->free(item->data);
 	}
+
+	free(queue->items);
+	pthread_mutex_destroy(&queue->lock);
+	pthread_cond_destroy(&queue->cond);
+	memset(queue, 0, sizeof(*queue));
 }
 
 static void destroy_mysql_pool(struct context *ctx)
@@ -1002,9 +1047,28 @@ static void destroy_client_slot(struct client_slot *cs)
 	memset(cs, 0, sizeof(*cs));
 }
 
-static void put_client_slot(struct worker *wrk, struct client *client)
+static bool del_client_from_epoll(struct worker *wrk, struct client *client)
 {
 	int err;
+
+	err = epoll_ctl(wrk->epoll_fd, EPOLL_CTL_DEL, client->fd, NULL);
+	if (err < 0) {
+		err = -errno;
+		perror("epoll_ctl(EPOLL_CTL_DEL) in del_client_from_epoll()");
+		return false;
+	}
+
+	return true;
+}
+
+static bool put_client_slot(struct worker *wrk, struct client *client)
+{
+	int err;
+
+	err = client_sub_refcnt(client, 1);
+	assert(err > 0);
+	if (err > 1)
+		return false;
 
 	if (client->db_conn) {
 		put_mysql_conn(wrk, client->db_conn);
@@ -1017,6 +1081,8 @@ static void put_client_slot(struct worker *wrk, struct client *client)
 		fprintf(stderr, "Warning: push_stack() failed in put_client_slot() (wrk=%u; id=%u)\n",
 			wrk->id, client->id);
 	}
+
+	return true;
 }
 
 static struct client *get_client_slot(struct worker *wrk)
@@ -1044,6 +1110,8 @@ static struct client *get_client_slot(struct worker *wrk)
 		ret->buf_size = 4096;
 	}
 
+	err = atomic_fetch_add_explicit(&ret->refcnt, 1, memory_order_relaxed);
+	assert(err == 0);
 	return ret;
 }
 
@@ -1960,6 +2028,9 @@ static char *get_qs_val(const char *key, const char *qsq)
 	char *qs;
 	int len;
 
+	if (!qsq)
+		return NULL;
+
 	qs = strdup(qsq);
 	if (!qs)
 		return NULL;
@@ -1991,20 +2062,231 @@ out:
 	return ret;
 }
 
+static char *construct_query_get_user(struct mysql_conn *conn, const char *name,
+			    	      int64_t limit, int64_t start_id)
+{
+	char *q;
+	int ret;
+
+	if (limit > 300)
+		limit = 300;
+
+	if (start_id < 1)
+		start_id = 1;
+
+	if (name) {
+		char *tmp;
+		size_t len;
+
+		// Don't allow potential slow queries.
+		while (*name == '%')
+			name++;
+
+		len = strlen(name);
+		tmp = malloc(len * 2u + 1u);
+		if (!tmp)
+			return NULL;
+
+		mysql_real_escape_string(conn->mysql, tmp, name, len);
+		ret = asprintf(&q, "SELECT * FROM users WHERE _id >= %lld AND Nama_Rekening LIKE	 '%s%%' LIMIT %lld",
+		               (long long)start_id, tmp, (long long)limit);
+		free(tmp);
+	} else {
+		ret = asprintf(&q, "SELECT * FROM users WHERE _id >= %lld LIMIT %lld",
+		               (long long)start_id, (long long)limit);
+	}
+
+	if (ret < 0)
+		return NULL;
+
+	return q;
+}
+
+/*
+ * Expected JSON result:
+ *
+ * {
+ * 	"fields": ["_id", "name", "blah"],
+ * 	"rows": [
+ * 	   [1, "foo", "blah"],
+ * 	   [2, "bar", "blah"],
+ * 	   [3, "baz", "blah"]
+ * 	]
+ * }
+ */
+static char *json_result_query_get_user(MYSQL *mysql)
+{
+	unsigned int num_fields;
+	json_object *obj;
+	unsigned int i;
+	MYSQL_RES *res;
+	MYSQL_ROW row;
+	char *ret;
+
+	res = mysql_store_result(mysql);
+	if (!res)
+		return NULL;
+
+	num_fields = mysql_num_fields(res);
+	obj = json_object_new_object();
+	if (!obj) {
+		mysql_free_result(res);
+		return NULL;
+	}
+
+	json_object_object_add(obj, "fields", json_object_new_array());
+	for (i = 0; i < num_fields; i++) {
+		MYSQL_FIELD *field = mysql_fetch_field_direct(res, i);
+		json_object_array_add(json_object_object_get(obj, "fields"),
+				      json_object_new_string(field->name));
+	}
+
+	json_object_object_add(obj, "rows", json_object_new_array());
+	while ((row = mysql_fetch_row(res))) {
+		json_object *row_obj = json_object_new_array();
+		unsigned long *lengths = mysql_fetch_lengths(res);
+
+		for (i = 0; i < num_fields; i++) {
+			if (row[i])
+				json_object_array_add(row_obj,
+						      json_object_new_string_len(row[i],
+										lengths[i]));
+			else
+				json_object_array_add(row_obj, NULL);
+		}
+
+		json_object_array_add(json_object_object_get(obj, "rows"),
+				      row_obj);
+	}
+
+	mysql_free_result(res);
+	ret = strdup(json_object_to_json_string(obj));
+	json_object_put(obj);
+	return ret;
+}
+
+static char *query_get_user(struct mysql_conn *conn, const char *name,
+			    int64_t limit, int64_t start_id)
+{
+	char *q;
+	int ret;
+
+	q = construct_query_get_user(conn, name, limit, start_id);
+	if (!q)
+		return NULL;
+
+	ret = mysql_query(conn->mysql, q);
+	free(q);
+	if (ret) {
+		fprintf(stderr, "Warning: mysql_query() failed: %s\n",
+			mysql_error(conn->mysql));
+		return NULL;
+	}
+
+	return json_result_query_get_user(conn->mysql);
+}
+
+static void destroy_json_query_result(char *res)
+{
+	free(res);
+}
+
+struct get_user_arg {
+	struct mysql_conn *conn;
+	struct worker *wrk;
+	struct client *cl;
+	char *offset;
+	char *limit;
+	char *name;
+};
+
+static void gwbsid_get_user(void *argx)
+{
+	struct get_user_arg *arg = argx;
+	int64_t limit = 100;
+	int64_t offset = 0;
+	size_t len;
+	char *res;
+
+	if (arg->offset) {
+		offset = strtoll(arg->offset, NULL, 10);
+		if (offset < 0)
+			offset = 0;
+	}
+
+	if (arg->limit) {
+		limit = strtoll(arg->limit, NULL, 10);
+		if (limit < 0)
+			limit = 100;
+	}
+
+	arg->conn = get_mysql_conn(arg->wrk);
+	if (IS_ERR(arg->conn)) {
+		fprintf(stderr, "Warning: Failed to get MySQL connection (wrk: %u)\n",
+			arg->wrk->id);
+		return;
+	}
+
+	res = query_get_user(arg->conn, arg->name, limit, offset);
+	if (!res) {
+		fprintf(stderr, "Warning: Failed to query_get_user()\n");
+		return;
+	}
+
+	if (client_get_refcnt(arg->cl) == 1) {
+		destroy_json_query_result(res);
+		printf("Client %s is gone, not sending response\n",
+			get_str_ss(&arg->cl->addr));
+		return;
+	}
+
+	len = strlen(res);
+	http_res_code(arg->cl, 200);
+	http_res_add_hdr(arg->cl, "Content-Type", "application/json");
+	http_res_add_hdr(arg->cl, "Content-Length", "%zu", len);
+	http_res_add_body(arg->cl, res);
+	http_res_commit(arg->wrk, arg->cl);
+	destroy_json_query_result(res);
+}
+
+static void gwbsid_free_get_user(void *arg)
+{
+	struct get_user_arg *a = arg;
+
+	if (a->conn && !IS_ERR(a->conn))
+		put_mysql_conn(a->wrk, a->conn);
+
+	put_client_slot(a->wrk, a->cl);
+	free(a->offset);
+	free(a->name);
+	free(a);
+}
+
 static int http_route_gwbsid_api_v1(struct worker *wrk, struct client *cl)
 {
-	char *offset;
-	char *name;
+	struct get_user_arg *arg;
+	int ret;
 
-	offset = get_qs_val("offset", cl->header.qs);
-	name = get_qs_val("name", cl->header.qs);
+	arg = malloc(sizeof(*arg));
+	if (!arg)
+		return -ENOMEM;
 
-	printf("offset = %s\n", offset);
-	printf("name = %s\n", name);
+	arg->offset = get_qs_val("offset", cl->header.qs);
+	arg->limit = get_qs_val("limit", cl->header.qs);
+	arg->name = get_qs_val("name", cl->header.qs);
+	arg->conn = NULL;
+	arg->wrk = wrk;
+	arg->cl = cl;
 
-	free(offset);
-	free(name);
-	return http_route_404(wrk, cl);
+	client_add_refcnt(cl, 1);
+	ret = schedule_work(wrk, gwbsid_get_user, arg, gwbsid_free_get_user);
+	if (ret < 0) {
+		free(arg);
+		client_sub_refcnt(cl, 1);
+		return http_route_404(wrk, cl);
+	}
+
+	return 0;
 }
 
 static int exec_http_router(struct worker *wrk, struct client *cl)
@@ -2015,7 +2297,7 @@ static int exec_http_router(struct worker *wrk, struct client *cl)
 	if (!strncmp(cl->header.uri, "/assets/", 8))
 		return http_route_static(wrk, cl);
 
-	if (!strncmp(cl->header.uri, "/gwbsid/api/v1/", 15))
+	if (!strcmp(cl->header.uri, "/gwbsid/api/v1/get_user"))
 		return http_route_gwbsid_api_v1(wrk, cl);
 
 	return http_route_404(wrk, cl);
@@ -2082,7 +2364,7 @@ static int _handle_client_event(struct worker *wrk, struct epoll_event *ev)
 	return 0;
 
 out_close:
-	epoll_ctl(wrk->epoll_fd, EPOLL_CTL_DEL, cl->fd, NULL);
+	del_client_from_epoll(wrk, cl);
 	put_client_slot(wrk, cl);
 	return 0;
 }
@@ -2206,8 +2488,8 @@ static void destroy_io_workers(struct context *ctx)
 static void destroy_context(struct context *ctx)
 {
 	ctx->stop = true;
-	destroy_workers(ctx);
 	destroy_io_workers(ctx);
+	destroy_workers(ctx);
 	destroy_work_queue(ctx);
 	destroy_mysql_pool(ctx);
 	destroy_tcp_socket(ctx);
@@ -2253,7 +2535,7 @@ out:
 
 int main(void)
 {
-	pid_t pids[NR_FORK_WORKERS - 1];
+	pid_t pids[NR_FORK_WORKERS];
 	struct context ctx;
 	size_t i;
 	int ret;
@@ -2265,15 +2547,17 @@ int main(void)
 	if (ret)
 		return -ret;
 
-	for (i = 0; i < ARRAY_SIZE(pids); i++) {
-		pids[i] = fork();
-		if (pids[i] == 0)
-			return run_web_server(&ctx);
+	if (ARRAY_SIZE(pids) > 1) {
+		for (i = 0; i < ARRAY_SIZE(pids); i++) {
+			pids[i] = fork();
+			if (pids[i] == 0)
+				return run_web_server(&ctx);
 
-		if (pids[i] < 0) {
-			ret = errno;
-			perror("fork() in main()");
-			return ret;
+			if (pids[i] < 0) {
+				ret = errno;
+				perror("fork() in main()");
+				return ret;
+			}
 		}
 	}
 
