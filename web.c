@@ -2396,7 +2396,8 @@ static int handle_client_event(struct worker *wrk, struct epoll_event *ev)
 		return 0;
 	}
 
-	return _handle_client_event(wrk, ev);
+	_handle_client_event(wrk, ev);
+	return 0;
 }
 
 static int handle_event(struct worker *wrk, struct epoll_event *ev)
@@ -2438,6 +2439,7 @@ static void *run_worker(void *arg)
 			break;
 
 		ret = handle_events(wrk, ret);
+		printf("handle_events() returned %d\n", ret);
 		if (ret < 0)
 			break;
 	}
