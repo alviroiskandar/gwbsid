@@ -31,6 +31,7 @@
 #include <time.h>
 #include <ctype.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 
 #define TCP_LISTEN_BACKLOG	1024
@@ -39,6 +40,8 @@
 #define NR_WORK_ITEMS		1024
 #define NR_EPOLL_EVENTS		32
 #define NR_CLIENTS		1024
+#define NR_FORK_WORKERS		4
+#define ARRAY_SIZE(X)		(sizeof(X) / sizeof((X)[0]))
 
 enum {
 	TASK_COMM_LEN = 16,
@@ -834,8 +837,10 @@ static void put_client_slot(struct worker *wrk, struct client *client)
 
 	reset_client(client);
 	err = push_stack(&wrk->client_slot.stack, client->id);
-	if (err)
-		fprintf(stderr, "Warning: push_stack() failed in put_client_slot()\n");
+	if (err) {
+		fprintf(stderr, "Warning: push_stack() failed in put_client_slot() (wrk=%u; id=%u)\n",
+			wrk->id, client->id);
+	}
 }
 
 static struct client *get_client_slot(struct worker *wrk)
@@ -1598,7 +1603,6 @@ static int http_queue_response(struct worker *wrk, struct client *cl)
 			return ret;
 	}
 
-	wrk->kill_current = true;
 	return 0;
 }
 
@@ -1681,8 +1685,8 @@ static int handle_client_pollout(struct worker *wrk, struct client *cl)
 	int ret;
 
 	ret = http_queue_response(wrk, cl);
-	if (wrk->kill_current || ret < 0)
-		put_client_slot(wrk, cl);
+	if (ret < 0)
+		wrk->kill_current = true;
 
 	return ret;
 }
@@ -1825,9 +1829,45 @@ static void destroy_context(struct context *ctx)
 	destroy_tcp_socket(ctx);
 }
 
+static int run_web_server(struct context *ctx)
+{
+	int ret;
+
+	ret = parse_mysql_env(&ctx->mysql_cred);
+	if (ret)
+		return -ret;
+
+	ret = parse_tcp_bind_cfg(&ctx->tcp_bind_cfg);
+	if (ret)
+		return -ret;
+
+	ret = init_tcp_socket(ctx);
+	if (ret)
+		return ret;
+
+	ret = init_mysql_pool(ctx);
+	if (ret)
+		goto out;
+
+	ret = init_work_queue(ctx);
+	if (ret)
+		goto out;
+
+	ret = init_workers(ctx);
+	if (ret)
+		goto out;
+
+	ret = PTR_ERR(run_worker(&ctx->workers[0]));
+out:
+	destroy_context(ctx);
+	return ret;
+}
+
 int main(void)
 {
+	pid_t pids[NR_FORK_WORKERS - 1];
 	struct context ctx;
+	size_t i;
 	int ret;
 
 	memset(&ctx, 0, sizeof(ctx));
@@ -1837,32 +1877,21 @@ int main(void)
 	if (ret)
 		return -ret;
 
-	ret = parse_mysql_env(&ctx.mysql_cred);
-	if (ret)
-		return -ret;
+	for (i = 0; i < ARRAY_SIZE(pids); i++) {
+		pids[i] = fork();
+		if (pids[i] == 0)
+			return run_web_server(&ctx);
 
-	ret = parse_tcp_bind_cfg(&ctx.tcp_bind_cfg);
-	if (ret)
-		return -ret;
+		if (pids[i] < 0) {
+			ret = errno;
+			perror("fork() in main()");
+			return ret;
+		}
+	}
 
-	ret = init_tcp_socket(&ctx);
-	if (ret)
-		return ret;
+	ret = run_web_server(&ctx);
+	for (i = 0; i < ARRAY_SIZE(pids); i++)
+		waitpid(pids[i], NULL, 0);
 
-	ret = init_mysql_pool(&ctx);
-	if (ret)
-		goto out;
-
-	ret = init_work_queue(&ctx);
-	if (ret)
-		goto out;
-
-	ret = init_workers(&ctx);
-	if (ret)
-		goto out;
-
-	ret = PTR_ERR(run_worker(&ctx.workers[0]));
-out:
-	destroy_context(&ctx);
-	return ret;
+	return 0;
 }
