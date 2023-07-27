@@ -5,33 +5,104 @@
 	<title>gwbsid - GNU/Weeb BSI Database Daemon (Web Service)</title>
 </head>
 <body>
-
 <div id="layer_heading">
 	<h2>GNU/Weeb BSI Database Daemon (Web Service)</h2>
 	<h3>We are working to build community through open source technology.</h3>
 	<h3>NB: members on GitHub must have two-factor auth.</h3>
 	<h4>Source code: <a target="_blank" href="https://github.com/alviroiskandar/gwbsid.git">https://github.com/alviroiskandar/gwbsid.git</a></h4>
+	<h2>tq for the support!</h2>
+	<img src="assets/img/logo_bsi.jpg" alt="BSI" id="bsi_logo"/>
 </div>
 
-<div id="layer_loading">
+<div style="display: none;" id="layer_menu">
+	<div>
+		<h1>Open Table</h1>
+		<a href="?table=users" class="mbtn">Users</a>
+	</div>
+</div>
+
+<div style="display: none;" id="layer_loading">
 	<div id="loading_text"><h1>Loading data...</h1></div>
 </div>
 
-<div id="layer_table">
-	<table>
-	</table>
+<div style="display: none;" id="layer_table">
+	<div id="ptbl_users" class="tb_cage">
+		<div class="btn_cage">
+			<a href="?" class="mbtn">Back to Menu</a>
+			<a href="javascript:handle_prev_page('users');" class="mbtn prev-btn">Prev Page</a>
+			<a href="javascript:handle_next_page('users');" class="mbtn next-btn">Next Page</a>
+		</div>
+		<h1>Current Page: <span class="cur_page"></span></h1>
+		<table border="1">
+			<thead></thead>
+			<tbody></tbody>
+		</table>
+	</div>
 </div>
 
 <style type="text/css">
 	html {
-		font-family: Arial, Helvetica, sans-serif;
+		font-family: 'Segoe UI', Tahoma, Geneva, Verdana;
+		background-color: #daebf2;
+	}
+	.mbtn {
+		-moz-box-shadow:inset 0px 0px 15px 0px #e184f3;
+		-webkit-box-shadow:inset 0px 0px 15px 0px #e184f3;
+		box-shadow:inset 0px 0px 15px 0px #e184f3;
+		background:-webkit-gradient(linear, left top, left bottom, color-stop(0.05, #c123de), color-stop(1, #a20dbd));
+		background:-moz-linear-gradient(top, #c123de 5%, #a20dbd 100%);
+		background:-webkit-linear-gradient(top, #c123de 5%, #a20dbd 100%);
+		background:-o-linear-gradient(top, #c123de 5%, #a20dbd 100%);
+		background:-ms-linear-gradient(top, #c123de 5%, #a20dbd 100%);
+		background:linear-gradient(to bottom, #c123de 5%, #a20dbd 100%);
+		filter:progid:DXImageTransform.Microsoft.gradient(startColorstr='#c123de', endColorstr='#a20dbd',GradientType=0);
+		background-color:#c123de;
+		-webkit-border-radius:7px;
+		-moz-border-radius:7px;
+		border-radius:7px;
+		border:4px solid #a511c0;
+		display:inline-block;
+		cursor:pointer;
+		color:#ffffff;
+		font-family:Arial;
+		font-size:23px;
+		font-weight:bold;
+		padding:13px 43px;
+		text-decoration:none;
+		text-shadow:-1px -1px 9px #9b14b3;
+	}
+	.mbtn:hover {
+		background:-webkit-gradient(linear, left top, left bottom, color-stop(0.05, #a20dbd), color-stop(1, #c123de));
+		background:-moz-linear-gradient(top, #a20dbd 5%, #c123de 100%);
+		background:-webkit-linear-gradient(top, #a20dbd 5%, #c123de 100%);
+		background:-o-linear-gradient(top, #a20dbd 5%, #c123de 100%);
+		background:-ms-linear-gradient(top, #a20dbd 5%, #c123de 100%);
+		background:linear-gradient(to bottom, #a20dbd 5%, #c123de 100%);
+		filter:progid:DXImageTransform.Microsoft.gradient(startColorstr='#a20dbd', endColorstr='#c123de',GradientType=0);
+		background-color:#a20dbd;
+	}
+	.mbtn:active {
+		position: relative;
+		top: 1px;
+	}
+	.btn_cage {
+		text-align: center;
+		margin-bottom: 30px;
+	}
+	#bsi_logo {
+		width: 80%;
+		height: 80%;
+		border-radius: 10px;
+		border: 2px solid #000;
 	}
 	#layer_heading {
 		text-align: center;
 		border: 3px solid #000;
 		border-radius: 10px;
-		width: 600px;
+		width: 700px;
 		margin: auto;
+		padding-bottom: 30px;
+		margin-bottom: 30px;
 	}
 	#layer_heading h4 a {
 		color: #0000ff;
@@ -57,12 +128,50 @@
 		-ms-transform: translate(-50%, -50%);
 		transform: translate(-50%, -50%);
 	}
+	.tb_cage {
+		text-align: center;
+	}
+	.tb_cage table {
+		border-collapse: collapse;
+		border: 3px solid #000;
+		border-radius: 10px;
+		width: 600px;
+		margin: auto;
+		margin-top: 30px;
+	}
+	.tb_cage table thead tr th {
+		text-align: center;
+		padding: 10px;
+	}
+	.tb_cage table tbody tr td {
+		text-align: center;
+		padding: 10px;
+	}
+	#layer_menu {
+		text-align: center;
+		border: 3px solid #000;
+		border-radius: 10px;
+		width: 600px;
+		margin: auto;
+		margin-top: 30px;
+		padding: 20px 10px 40px 10px;
+	}
+	.tra {
+		background-color: #dff5df
+	}
+	.trb {
+		background-color: #d3affc;
+	}
+	.tra:hover {
+		background-color: #ffee00;
+	}
+	.trb:hover {
+		background-color: #ffee00;
+	}
 </style>
 
 <script type="text/javascript" src="assets/js/helpers.js"></script>
-<script type="text/javascript">
-
-</script>
+<script type="text/javascript" src="assets/js/index.js"></script>
 
 </body>
 </html>
