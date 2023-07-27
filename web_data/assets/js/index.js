@@ -13,9 +13,6 @@ const g_table_state = {
 		}
 	}
 };
-const g_table_cache = {
-	users: null
-};
 
 function start_tbl_loading()
 {
@@ -137,39 +134,3 @@ __start();
 addEventListener("popstate", function (event) {
 	__start();
 });
-
-
-// function apply_url_state(tb_name)
-// {
-// 	let state = g_table_state[tb_name];
-// 	let dest = "?table=" + tb_name +
-// 		   "&page=" + state.cur_page +
-// 		   "&limit=" + state.limit;
-
-// 	window.history.pushState(tb_name, "", dest);
-// }
-
-// function load_table(tb_name, propagate = true)
-// {
-// 	let state = g_table_state[tb_name];
-// 	open_table(table, state);
-// 	deq("#ptbl_users h1 .cur_page").innerHTML = state.cur_page;
-// }
-
-// function handle_next_page(tb_name)
-// {
-
-// }
-
-// function handle_prev_page(tb_name)
-// {
-
-// }
-
-// if (table) {
-// 	let cur_table = g_qs.get("table", table);
-// 	propagate_url();
-// 	load_table(cur_table);
-// } else {
-// 	gq_show(layer_menu);
-// }
