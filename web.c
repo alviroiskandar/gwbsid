@@ -2222,6 +2222,12 @@ static void gwbsid_get_user(void *argx)
 	char *res;
 	int ret;
 
+	if (client_get_refcnt(arg->cl) == 1) {
+		printf("Client %s is gone, not sending response\n",
+			get_str_ss(&arg->cl->addr));
+		return;
+	}
+
 	if (arg->start_id) {
 		start_id = strtoll(arg->start_id, NULL, 10);
 		if (start_id < 0)
