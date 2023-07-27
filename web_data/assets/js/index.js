@@ -124,6 +124,23 @@ function handle_prev_page()
 	open_table();
 }
 
+function handle_jump_page()
+{
+	let page = prompt("Jump to page:");
+	if (page == null)
+		return;
+
+	page = parseInt(page);
+	if (isNaN(page)) {
+		window.alert("Invalid page number.");
+		return;
+	}
+
+	g_table_state.cur_page = page;
+	apply_url_state();
+	open_table();
+}
+
 function __start()
 {
 	if (g_qs.has("table")) {
