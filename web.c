@@ -2198,7 +2198,7 @@ struct get_user_arg {
 	struct mysql_conn *conn;
 	struct worker *wrk;
 	struct client *cl;
-	char *offset;
+	char *start_id;
 	char *limit;
 	char *name;
 };
@@ -2206,16 +2206,16 @@ struct get_user_arg {
 static void gwbsid_get_user(void *argx)
 {
 	struct get_user_arg *arg = argx;
+	int64_t start_id = 0;
 	int64_t limit = 100;
-	int64_t offset = 0;
 	size_t len;
 	char *res;
 	int ret;
 
-	if (arg->offset) {
-		offset = strtoll(arg->offset, NULL, 10);
-		if (offset < 0)
-			offset = 0;
+	if (arg->start_id) {
+		start_id = strtoll(arg->start_id, NULL, 10);
+		if (start_id < 0)
+			start_id = 0;
 	}
 
 	if (arg->limit) {
@@ -2231,7 +2231,7 @@ static void gwbsid_get_user(void *argx)
 		return;
 	}
 
-	res = query_get_user(arg->conn, arg->name, limit, offset);
+	res = query_get_user(arg->conn, arg->name, limit, start_id);
 	if (!res) {
 		fprintf(stderr, "Warning: Failed to query_get_user()\n");
 		return;
@@ -2276,7 +2276,7 @@ static void gwbsid_free_get_user(void *arg)
 	if (a->cl)
 		put_client_slot(a->wrk, a->cl);
 
-	free(a->offset);
+	free(a->start_id);
 	free(a->limit);
 	free(a->name);
 	free(a);
@@ -2291,7 +2291,7 @@ static int http_route_gwbsid_api_v1(struct worker *wrk, struct client *cl)
 	if (!arg)
 		return -ENOMEM;
 
-	arg->offset = get_qs_val("offset", cl->header.qs);
+	arg->start_id = get_qs_val("start_id", cl->header.qs);
 	arg->limit = get_qs_val("limit", cl->header.qs);
 	arg->name = get_qs_val("name", cl->header.qs);
 	arg->conn = NULL;
