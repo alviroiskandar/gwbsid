@@ -9,7 +9,7 @@ const g_table_state = {
 	limit: 20,
 	tables: {
 		users: {
-			nr_rows: 1024
+			nr_rows: 24453797
 		}
 	}
 };
@@ -63,7 +63,7 @@ function open_table()
 	let prev_btn = deq("#" + tbid + " .btn_cage .prev-btn");
 	let next_btn = deq("#" + tbid + " .btn_cage .next-btn");
 
-	deq("#" + tbid + " h1 .cur_page").innerHTML = st.cur_page;
+	deq("#" + tbid + " h1 .cur_page").innerHTML = st.cur_page + " of " + max_page;
 	if (st.cur_page == 1)
 		gq_hide(prev_btn);
 	else
