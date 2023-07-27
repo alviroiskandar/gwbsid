@@ -126,13 +126,20 @@ function handle_prev_page()
 
 function handle_jump_page()
 {
-	let page = prompt("Jump to page:");
+	let st = g_table_state;
+	let max_page = Math.ceil(st.tables[st.cur_table].nr_rows / st.limit);
+	let page = prompt("Jump to page [1, " + max_page + "]:", st.cur_page);
 	if (page == null)
 		return;
 
 	page = parseInt(page);
 	if (isNaN(page)) {
 		window.alert("Invalid page number.");
+		return;
+	}
+
+	if (page < 1 || page > max_page) {
+		window.alert("Page number out of range.");
 		return;
 	}
 
