@@ -6,7 +6,7 @@ const layer_menu = gid("layer_menu");
 const g_table_state = {
 	cur_table: null,
 	cur_page: 1,
-	limit: 20,
+	limit: 30,
 	tables: {
 		users: {
 			nr_rows: 24453797
@@ -78,6 +78,7 @@ function open_table()
 function propagate_url_table_state()
 {
 	let table = g_qs.get("table");
+	let max_page = Math.ceil(g_table_state.tables[table].nr_rows / g_table_state.limit);
 	let cur_page = 1;
 	let limit = 30;	
 
@@ -91,8 +92,13 @@ function propagate_url_table_state()
 	g_table_state.cur_page = cur_page;
 	g_table_state.limit = limit;
 
-	if (cur_page < 1) {
+	if (isNaN(cur_page) || cur_page < 1) {
 		g_table_state.cur_page = 1;
+		apply_url_state();
+	}
+
+	if (cur_page > max_page) {
+		g_table_state.cur_page = max_page;
 		apply_url_state();
 	}
 }
