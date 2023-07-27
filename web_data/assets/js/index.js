@@ -90,6 +90,11 @@ function propagate_url_table_state()
 	g_table_state.cur_table = table;
 	g_table_state.cur_page = cur_page;
 	g_table_state.limit = limit;
+
+	if (cur_page < 1) {
+		g_table_state.cur_page = 1;
+		apply_url_state();
+	}
 }
 
 function apply_url_state()
