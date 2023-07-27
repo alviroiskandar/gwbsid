@@ -132,6 +132,7 @@ struct client {
 	struct timespec		last_active;
 	struct cancel_point	*cancel;
 	bool			pollout;
+	bool			got_header;
 	_Atomic(int)		refcnt;
 };
 
@@ -995,6 +996,7 @@ static void reset_client(struct client *client)
 	memset(&client->res, 0, sizeof(client->res));
 	client->buf_len = 0;
 	client->pollout = false;
+	client->got_header = false;
 	res_body->fd = -1;
 }
 
@@ -1585,6 +1587,9 @@ static int parse_http_headers(struct client *cl)
 	char *next;
 	int ret;
 
+	if (cl->got_header)
+		return 0;
+
 	if (len < 4)
 		return 0;
 
@@ -1595,7 +1600,12 @@ static int parse_http_headers(struct client *cl)
 	if (ret < 0)
 		return ret;
 
-	return parse_http_header_fields(cl, &next);
+	ret = parse_http_header_fields(cl, &next);
+	if (ret < 0)
+		return ret;
+
+	cl->got_header = true;
+	return 0;
 }
 
 static int http_res_code(struct client *cl, int code)
@@ -2334,6 +2344,9 @@ static int handle_client_pollin(struct worker *wrk, struct client *cl)
 	ret = parse_http_headers(cl);
 	if (ret < 0)
 		goto out_kill;
+
+	if (!cl->got_header)
+		return 0;
 
 	ret = exec_http_router(wrk, cl);
 	if (ret < 0)
