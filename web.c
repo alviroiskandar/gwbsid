@@ -2367,17 +2367,13 @@ static int _handle_client_event(struct worker *wrk, struct epoll_event *ev)
 	wrk->kill_current = false;
 	if (ev->events & EPOLLIN) {
 		ret = handle_client_pollin(wrk, cl);
-		if (ret < 0)
-			return ret;
-		if (wrk->kill_current)
+		if (ret < 0 || wrk->kill_current)
 			goto out_close;
 	}
 
 	if (ev->events & EPOLLOUT) {
 		ret = handle_client_pollout(wrk, cl);
-		if (ret < 0)
-			return ret;
-		if (wrk->kill_current)
+		if (ret < 0 || wrk->kill_current)
 			goto out_close;
 	}
 
@@ -2439,7 +2435,6 @@ static void *run_worker(void *arg)
 			break;
 
 		ret = handle_events(wrk, ret);
-		printf("handle_events() returned %d\n", ret);
 		if (ret < 0)
 			break;
 	}
