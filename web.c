@@ -5,6 +5,7 @@
 
 #include "web.h"
 #include "web_src/route.h"
+#include <strings.h>
 
 static struct context *g_ctx;
 
@@ -1263,7 +1264,7 @@ static bool is_eligible_for_keep_alive(struct client *cl)
 
 	val = http_req_hdr_get_field(hdr, "connection");
 	if (val)
-		return !strcmp(val, "keep-alive");
+		return !strcasecmp(val, "keep-alive");
 
 	val = &hdr->buf[hdr->off_version];
 	return !strcmp(val, "HTTP/1.1");
@@ -1596,6 +1597,8 @@ static int construct_http_res_hdr(struct client *cl)
 		len += sizeof("\r\n") - 1;
 	}
 
+	len += sizeof("Connection: keep-alive\r\n") - 1;
+
 	buf = malloc(len + 1u);
 	if (!buf) {
 		errno = ENOMEM;
@@ -1608,6 +1611,11 @@ static int construct_http_res_hdr(struct client *cl)
 			       &req_hdr->buf[req_hdr->off_version],
 			       res_hdr->status,
 			       http_code_to_str(res_hdr->status));
+
+	if (cl->keep_alive) {
+		memcpy(&buf[len], "Connection: keep-alive\r\n", 24u);
+		len += 24u;
+	}
 
 	for (i = 0; i < res_hdr->nr_fields; i++) {
 		struct http_hdr_field *field = &res_hdr->fields[i];
