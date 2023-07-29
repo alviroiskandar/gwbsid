@@ -1794,7 +1794,6 @@ static int handle_client_send_event(struct context *ctx, struct client *cl)
 	if (ret == -EAGAIN && !cl->pollout_set) {
 		union epoll_data data;
 
-		printf("setting epollout!\n");
 		data.ptr = cl;
 		ret = epoll_mod(ctx, cl->fd, EPOLLIN | EPOLLOUT, data);
 		if (ret)
