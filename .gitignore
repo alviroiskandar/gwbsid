@@ -2,3 +2,4 @@
 /parser
 /mysql_data/
 /web
+*.o

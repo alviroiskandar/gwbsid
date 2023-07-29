@@ -3,290 +3,10 @@
  * Copyright (C) 2023  Alviro Iskandar Setiawan <alviro.iskandar@gnuweeb.org>
  */
 
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-
-#ifndef _POSIX_C_SOURCE
-#define _POSIX_C_SOURCE	200809L
-#endif
-
-#include <json-c/json.h>
-#include <mysql/mysql.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/epoll.h>
-#include <errno.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
-#include <stdint.h>
-#include <string.h>
-#include <stdatomic.h>
-#include <arpa/inet.h>
-#include <assert.h>
-#include <signal.h>
-#include <pthread.h>
-#include <stdbool.h>
-#include <sys/eventfd.h>
-#include <time.h>
-#include <ctype.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
-#include <fcntl.h>
-#include <limits.h>
-#include <sys/mman.h>
-#define CLIENT_BUF_SIZE		4096
-#define TCP_LISTEN_BACKLOG	1024
-#define MYSQL_POOL_SIZE		128
-#define NR_WORK_ITEMS		1024
-#define NR_EPOLL_EVENTS		32
-#define NR_CLIENTS		1024
-#define NR_WQ_WORKERS		32
-#define NR_WORKERS		2
-#define ARRAY_SIZE(X)		(sizeof(X) / sizeof((X)[0]))
-
-enum {
-	TASK_COMM_LEN = 16,
-};
-
-struct stack {
-	uint32_t		*data;
-	size_t			size;
-	size_t			top;
-	pthread_mutex_t		lock;
-};
-
-struct mysql_conn {
-	MYSQL		*mysql;
-	bool		is_used;
-};
-
-struct mysql_pool {
-	struct mysql_conn	*conns;
-	struct stack		stack;
-};
-
-struct sockaddr_uin46 {
-	union {
-		struct sockaddr		sa;
-		struct sockaddr_in	in4;
-		struct sockaddr_in6	in6;
-	};
-};
-
-enum {
-	T_RES_BODY_UINITIALIZED = 0,
-	T_RES_BODY_BUFFER       = 1,
-	T_RES_BODY_FD           = 2,
-	T_RES_BODY_MAP_FD       = 3,
-};
-
-enum {
-	T_CL_IDLE          = 0,
-	T_CL_RECV_REQ_HDR  = 1,
-	T_CL_RECV_REQ_BODY = 2,
-	T_CL_SEND_RES_HDR  = 3,
-	T_CL_SEND_RES_BODY = 4,
-	T_CL_CLOSE         = 5,
-};
-
-struct http_hdr_field_off {
-	uint16_t		off_key;
-	uint16_t		off_val;
-};
-
-struct http_hdr_field {
-	char			*key;
-	char			*val;
-};
-
-struct http_req_hdr {
-	char				*buf;
-	struct http_hdr_field_off	*fields;
-	uint16_t			buf_len;
-	uint16_t			nr_fields;
-	uint16_t			off_method;
-	uint16_t			off_uri;
-	uint16_t			off_qs;
-	uint16_t			off_version;
-};
-
-struct http_req_body {
-	char				*buf;
-	uint16_t			buf_len;
-};
-
-struct http_res_hdr {
-	struct http_hdr_field		*fields;
-	uint16_t			nr_fields;
-	int16_t				status;
-};
-
-struct res_body_fd {
-	int		fd;
-	uint64_t	off;
-	uint64_t	size;
-};
-
-struct res_body_map_fd {
-	uint8_t		*map;
-	uint64_t	off;
-	uint64_t	size;
-};
-
-struct res_body_buf {
-	uint8_t		*buf;
-	uint64_t	size;
-};
-
-struct http_res_body {
-	uint8_t		type;
-	union {
-		struct res_body_buf	buf;
-		struct res_body_fd	fd;
-		struct res_body_map_fd	map_fd;
-	};
-};
-
-struct client {
-	int			fd;
-	uint8_t			state;
-
-	struct sockaddr_uin46	addr;
-
-	char			*buf;
-
-	/*
-	 * The size of used buffer.
-	 */
-	uint32_t		buf_pos;
-
-	/*
-	 * The size of allocated buffer.
-	 */
-	uint32_t		buf_len;
-
-	uint32_t		id;
-
-	/*
-	 * Last time the client is active. For timeout purposes.
-	 */
-	struct timespec		last_active;
-
-	struct http_req_hdr	req_hdr;
-	struct http_res_hdr	res_hdr;
-	struct http_res_body	res_body;
-	struct http_req_body	req_body;
-};
-
-struct client_slot {
-	struct client	*clients;
-	struct stack	stack;
-};
-
-struct mysql_cred {
-	char	*host;
-	char	*user;
-	char	*pass;
-	char	*db;
-	uint16_t port;
-};
-
-struct tcp_bind_cfg {
-	const char	*host;
-	uint16_t	port;
-};
-
-struct work_queue;
-
-struct wq_worker {
-	bool			is_online;
-	uint32_t		id;
-	struct work_queue	*wq;
-	pthread_t		thread;
-};
-
-struct context;
-
-struct work_struct {
-	void	(*callback)(struct work_queue *wq, void *arg);
-	void	(*free)(void *arg);
-	void	*arg;
-};
-
-struct wq_queue {
-	struct work_struct	*works;
-	pthread_mutex_t		lock;
-	pthread_cond_t		cond;
-	uint32_t		head;
-	uint32_t		tail;
-	uint32_t		mask;
-};
-
-struct work_queue {
-	struct context		*ctx;
-	struct wq_worker	*workers;
-	struct wq_queue		queue;
-	uint32_t		nr_workers;
-};
-
-struct context {
-	/*
-	 * Indicator whether the program should stop.
-	 */
-	volatile bool		stop;
-
-	/*
-	 * The epoll FD.
-	 */
-	int			epoll_fd;
-
-	/*
-	 * The main TCP socket that listens for incoming connections.
-	 */
-	int			tcp_fd;
-
-	/*
-	 * Event FD to wake up epoll_wait().
-	 */
-	int			event_fd;
-
-	int			ep_timeout;
-
-	uint32_t		nr_events;
-
-	/*
-	 * Client slot.
-	 */
-	struct client_slot	client_slots;
-
-	struct timespec		now;
-
-	struct epoll_event	*events;
-
-	struct work_queue	wq;
-
-	struct mysql_cred	mysql_cred;
-	struct tcp_bind_cfg	tcp_bind_cfg;
-};
+#include "web.h"
+#include "web_src/route.h"
 
 static struct context *g_ctx;
-
-static inline void *ERR_PTR(long err)
-{
-	return (void *)err;
-}
-
-static inline long PTR_ERR(const void *ptr)
-{
-	return (long)ptr;
-}
-
-static inline bool IS_ERR(const void *ptr)
-{
-	return (unsigned long)ptr > (unsigned long)-4096ul;
-}
 
 static void sigaction_handler(int sig)
 {
@@ -328,7 +48,7 @@ err:
 	return -ret;
 }
 
-static int __push_stack(struct stack *st, uint32_t val)
+int __push_stack(struct stack *st, uint32_t val)
 {
 	uint32_t top;
 
@@ -341,7 +61,7 @@ static int __push_stack(struct stack *st, uint32_t val)
 	return 0;
 }
 
-static int __pop_stack(struct stack *st, uint32_t *val)
+int __pop_stack(struct stack *st, uint32_t *val)
 {
 	uint32_t top;
 
@@ -355,7 +75,7 @@ static int __pop_stack(struct stack *st, uint32_t *val)
 	return 0;
 }
 
-static int push_stack(struct stack *st, uint32_t val)
+int push_stack(struct stack *st, uint32_t val)
 {
 	int ret;
 
@@ -365,7 +85,7 @@ static int push_stack(struct stack *st, uint32_t val)
 	return ret;
 }
 
-static uint32_t count_stack(struct stack *st)
+uint32_t count_stack(struct stack *st)
 {
 	uint32_t ret;
 
@@ -375,7 +95,7 @@ static uint32_t count_stack(struct stack *st)
 	return ret;
 }
 
-static int pop_stack(struct stack *st, uint32_t *val)
+int pop_stack(struct stack *st, uint32_t *val)
 {
 	int ret;
 
@@ -385,7 +105,7 @@ static int pop_stack(struct stack *st, uint32_t *val)
 	return ret;
 }
 
-static int init_stack(struct stack *st, uint32_t size)
+int init_stack(struct stack *st, uint32_t size)
 {
 	uint32_t *data;
 	int ret;
@@ -410,7 +130,7 @@ static int init_stack(struct stack *st, uint32_t size)
 	return 0;
 }
 
-static void destroy_stack(struct stack *st)
+void destroy_stack(struct stack *st)
 {
 	if (st->data) {
 		free(st->data);
@@ -647,6 +367,8 @@ static void destroy_http_req_hdr(struct http_req_hdr *hdr)
 	} else {
 		assert(hdr->nr_fields == 0);
 	}
+
+	hdr->content_length = CONTENT_LENGTH_UNINITIALIZED;
 }
 
 static int init_http_req_hdr(struct http_req_hdr *hdr)
@@ -673,6 +395,14 @@ static void destroy_http_res_hdr(struct http_res_hdr *hdr)
 		hdr->nr_fields = 0;
 	} else {
 		assert(hdr->nr_fields == 0);
+	}
+
+	if (hdr->buf) {
+		free(hdr->buf);
+		hdr->buf = NULL;
+		hdr->buf_len = 0;
+	} else {
+		assert(hdr->buf_len == 0);
 	}
 }
 
@@ -717,9 +447,9 @@ static void destroy_http_res_body(struct http_res_body *body)
 		if (body->buf.buf) {
 			free(body->buf.buf);
 			body->buf.buf = NULL;
-			body->buf.size = 0;
+			body->buf.len = 0;
 		} else {
-			assert(body->buf.size == 0);
+			assert(body->buf.len == 0);
 		}
 		break;
 	case T_RES_BODY_FD:
@@ -733,44 +463,40 @@ static void destroy_http_res_body(struct http_res_body *body)
 			assert(body->fd.size == 0);
 		}
 		break;
-	case T_RES_BODY_MAP_FD:
-		if (body->map_fd.map) {
-			munmap(body->map_fd.map, body->map_fd.size);
-			body->map_fd.map = NULL;
-			body->map_fd.off = 0;
-			body->map_fd.size = 0;
+	case T_RES_BODY_MAP:
+		if (body->map.map) {
+			if (body->map.need_unmap)
+				munmap(body->map.map, body->map.size);
+			body->map.map = NULL;
+			body->map.off = 0;
+			body->map.size = 0;
 		} else {
-			assert(body->map_fd.off == 0);
-			assert(body->map_fd.size == 0);
+			assert(body->map.off == 0);
+			assert(body->map.size == 0);
 		}
 		break;
 	default:
 		assert(0);
 	}
+
+	body->type = T_RES_BODY_UINITIALIZED;
 }
 
 static int init_http_res_body(struct http_res_body *body)
 {
+	memset(body, 0, sizeof(*body));
 	body->type = T_RES_BODY_UINITIALIZED;
-	body->buf.buf = NULL;
-	body->buf.size = 0;
 	return 0;
 }
 
-static void reset_client(struct client *cl)
+static void __reset_client_soft(struct client *cl)
 {
-	if (cl->fd >= 0) {
-		printf("Closing a client connection (fd=%d; idx=%u, addr=%s)\n",
-		       cl->fd, cl->id, get_str_ss(&cl->addr));
-		close(cl->fd);
-		cl->fd = -1;
-	}
-
 	if (cl->buf) {
+		/*
+		 * We don't free the buffer here because we may
+		 * reuse it later.
+		 */
 		assert(cl->buf_len);
-		free(cl->buf);
-		cl->buf = NULL;
-		cl->buf_len = 0;
 		cl->buf_pos = 0;
 	} else {
 		assert(cl->buf_pos == 0);
@@ -781,6 +507,35 @@ static void reset_client(struct client *cl)
 	destroy_http_res_hdr(&cl->res_hdr);
 	destroy_http_req_body(&cl->req_body);
 	destroy_http_res_body(&cl->res_body);
+	cl->total_body_len = 0;
+	cl->pollout_set = false;
+}
+
+static void reset_client_keep_alive(struct client *cl)
+{
+	assert(cl->fd >= 0);
+	assert(cl->state == T_CL_IDLE);
+	__reset_client_soft(cl);
+}
+
+static void reset_client(struct client *cl)
+{
+	if (cl->fd >= 0) {
+		// printf("Closing a client connection (fd=%d; idx=%u; addr=%s)\n",
+		//        cl->fd, cl->id, get_str_ss(&cl->addr));
+		close(cl->fd);
+		cl->fd = -1;
+	}
+
+
+	if (cl->buf) {
+		assert(cl->buf_len);
+		free(cl->buf);
+		cl->buf = NULL;
+		cl->buf_len = 0;
+		cl->buf_pos = 0;
+	}
+	__reset_client_soft(cl);
 	memset(&cl->addr, 0, sizeof(cl->addr));
 	memset(&cl->last_active, 0, sizeof(cl->last_active));
 	cl->state = T_CL_CLOSE;
@@ -801,23 +556,22 @@ static int init_client_slot(struct context *ctx)
 	}
 
 	ret = init_stack(&slot->stack, i);
-	if (ret)
-		goto out;
+	if (ret) {
+		free(clients);
+		return ret;
+	}
 
 	while (i--) {
 		cl = &clients[i];
 		cl->id = i;
 		cl->fd = -1;
-		ret = push_stack(&slot->stack, i);
+		ret = __push_stack(&slot->stack, i);
 		reset_client(cl);
 		assert(!ret);
 	}
 
 	slot->clients = clients;
 	return 0;
-
-out:
-	return ret;
 }
 
 static int epoll_add(struct context *ctx, int fd, uint32_t events,
@@ -948,7 +702,7 @@ static int init_work_queue_queue(struct work_queue *wq)
 	if (ret) {
 		errno = ret;
 		perror("pthread_mutex_init() in init_work_queue_queue()");
-		free(queue);
+		free(works);
 		return -ret;
 	}
 
@@ -957,7 +711,7 @@ static int init_work_queue_queue(struct work_queue *wq)
 		errno = ret;
 		perror("pthread_cond_init() in init_work_queue_queue()");
 		pthread_mutex_destroy(&queue->lock);
-		free(queue);
+		free(works);
 		return -ret;
 	}
 
@@ -1080,7 +834,7 @@ static int poll_events(struct context *ctx)
 	int timeout = ctx->ep_timeout;
 	int ep_fd = ctx->epoll_fd;
 	int ret;
-	
+
 	ret = epoll_wait(ep_fd, events, nr_events, timeout);
 	if (ret < 0) {
 		ret = -errno;
@@ -1091,6 +845,7 @@ static int poll_events(struct context *ctx)
 		return ret;
 	}
 
+	ctx->iter++;
 	if (ret > 0)
 		clock_gettime(CLOCK_BOOTTIME, &ctx->now);
 
@@ -1224,9 +979,9 @@ static int __handle_new_conn(struct context *ctx, int fd,
 
 	cl->fd = fd;
 	cl->addr = *addr;
-	clock_gettime(CLOCK_BOOTTIME, &cl->last_active);
-	printf("Accepted a new client connection (fd=%d; idx=%u, addr=%s)\n",
-	       fd, cl->id, get_str_ss(&cl->addr));
+	cl->last_active = ctx->now;
+	// printf("Accepted a new client connection (fd=%d; idx=%u; addr=%s)\n",
+	//        fd, cl->id, get_str_ss(&cl->addr));
 	return 0;
 }
 
@@ -1236,8 +991,10 @@ static int handle_new_conn(struct context *ctx)
 	socklen_t len = sizeof(addr);
 	int tcp_fd = ctx->tcp_fd;
 	bool got_client = false;
+	uint32_t counter = 0;
 	int ret;
 
+again:
 	ret = do_accept(tcp_fd, &addr, &len, &got_client);
 	if (ret < 0)
 		return ret;
@@ -1251,7 +1008,14 @@ static int handle_new_conn(struct context *ctx)
 		return 0;
 	}
 
-	return __handle_new_conn(ctx, ret, &addr);
+	ret = __handle_new_conn(ctx, ret, &addr);
+	if (ret)
+		return ret;
+
+	if (++counter < 128)
+		goto again;
+
+	return 0;
 }
 
 static int handle_event_fd(struct context *ctx)
@@ -1296,41 +1060,27 @@ static int do_recv(struct client *cl)
 	return 0;
 }
 
-static char *http_hdr_get_uri(struct client *cl)
+static char *strtolower(char *str)
 {
-	struct http_req_hdr *hdr = &cl->req_hdr;
+	char *ret = str;
 
-	return &hdr->buf[hdr->off_uri];
-}
+	while (str[0]) {
+		str[0] = tolower(str[0]);
+		str++;
+	}
 
-static char *http_hdr_get_qs(struct client *cl)
-{
-	struct http_req_hdr *hdr = &cl->req_hdr;
-
-	if (hdr->off_qs == (uint16_t)-1)
-		return NULL;
-
-	return &hdr->buf[hdr->off_qs];
-}
-
-static char *http_hdr_get_method(struct client *cl)
-{
-	struct http_req_hdr *hdr = &cl->req_hdr;
-
-	return &hdr->buf[hdr->off_method];
-}
-
-static char *http_hdr_get_version(struct client *cl)
-{
-	struct http_req_hdr *hdr = &cl->req_hdr;
-
-	return &hdr->buf[hdr->off_version];
+	return ret;
 }
 
 static int parse_hdr_req_parse_method_uri_qs(struct http_req_hdr *hdr,
 					     char **second_line)
 {
 	char *buf, *end, *ptr;
+
+	assert(!hdr->off_method);
+	assert(!hdr->off_uri);
+	assert(!hdr->off_version);
+	assert(!hdr->off_qs);
 
 	buf = hdr->buf;
 	ptr = strchr(buf, '\r');
@@ -1354,7 +1104,7 @@ static int parse_hdr_req_parse_method_uri_qs(struct http_req_hdr *hdr,
 	/*
 	 * Extract the URI.
 	 */
-	hdr->off_uri = (uint32_t)(end - buf + 1u);
+	hdr->off_uri = (uint32_t)(end - buf);
 	if (end[0] != '/')
 		return -EINVAL;
 
@@ -1378,7 +1128,7 @@ static int parse_hdr_req_parse_method_uri_qs(struct http_req_hdr *hdr,
 	/*
 	 * Extract the HTTP version.
 	 */
-	hdr->off_version = (uint32_t)(end - buf + 1u);
+	hdr->off_version = (uint32_t)(end - buf);
 	if (strncmp(end, "HTTP/", 5u))
 		return -EINVAL;
 
@@ -1388,26 +1138,48 @@ static int parse_hdr_req_parse_method_uri_qs(struct http_req_hdr *hdr,
 static int parse_hdr_req_parse_fields(char *buf, struct http_req_hdr *hdr)
 {
 	struct http_hdr_field_off *tmp, *fields = NULL;
-	uint16_t nr_fields = 0;
+	uint16_t nr_fields = 0u;
+	uint16_t nr_alloc = 16u;
 	char *ptr, *end;
 	int err;
+
+	assert(!hdr->fields);
+	assert(!hdr->nr_fields);
+	assert(hdr->content_length == CONTENT_LENGTH_UNINITIALIZED);
 
 	ptr = buf;
 	if (!ptr[0])
 		return 0;
 
+	fields = malloc(nr_alloc * sizeof(*fields));
+	if (!fields) {
+		errno = ENOMEM;
+		perror("malloc() in parse_hdr_req_parse_fields()");
+		return -ENOMEM;
+	}
+
+	hdr->content_length = CONTENT_LENGTH_NOT_PRESENT;
 	err = -EINVAL;
 	while (ptr[0]) {
+		char *key, *val;
+
+		if (ptr[0] == '\r' && ptr[1] == '\n')
+			break;
+
 		nr_fields++;
-		tmp = realloc(fields, nr_fields * sizeof(*fields));
-		if (!tmp) {
-			errno = ENOMEM;
-			perror("realloc() in parse_hdr_req_parse_fields()");
-			err = -ENOMEM;
-			goto out_err;
+
+		if (nr_fields > nr_alloc) {
+			nr_alloc *= 2;
+			tmp = realloc(fields, nr_alloc * sizeof(*fields));
+			if (!tmp) {
+				errno = ENOMEM;
+				perror("realloc() in parse_hdr_req_parse_fields()");
+				err = -ENOMEM;
+				goto out_err;
+			}
+			fields = tmp;
 		}
 
-		fields = tmp;
 		tmp = &fields[nr_fields - 1];
 		tmp->off_key = (uint16_t)(ptr - hdr->buf);
 
@@ -1415,18 +1187,33 @@ static int parse_hdr_req_parse_fields(char *buf, struct http_req_hdr *hdr)
 		if (!end)
 			goto out_err;
 
+		key = strtolower(ptr);
 		*end++ = '\0';
 		tmp->off_val = (uint16_t)(end - hdr->buf + 1u);
 
+		val = end;
 		ptr = strchr(end, '\r');
 		if (!ptr)
 			goto out_err;
 
-		*ptr++ = '\0';
-		if (ptr[0] != '\n')
+		*ptr = '\0';
+		if (ptr[1] != '\n')
 			goto out_err;
 
-		ptr++;
+		if (!strcmp("content-length", key)) {
+			char *eptr;
+			int64_t cl;
+
+			cl = (int64_t)strtoll(val, &eptr, 10);
+			if (eptr[0] != '\0')
+				cl = CONTENT_LENGTH_INVALID;
+
+			hdr->content_length = cl;
+		} else if (!strcmp("transfer-encoding", key) && !strcmp("chunked", val)) {
+			hdr->content_length = CONTENT_LENGTH_CHUNKED;
+		}
+
+		ptr += 2;
 	}
 
 	hdr->fields = fields;
@@ -1438,12 +1225,57 @@ out_err:
 	return err;
 }
 
-static int parse_http_req_hdr(struct client *cl)
+void *memdup(const void *buf, size_t len)
+{
+	void *ret;
+
+	ret = malloc(len);
+	if (!ret)
+		return NULL;
+
+	return memcpy(ret, buf, len);
+}
+
+static int handle_client_recv_event(struct context *ctx, struct client *cl);
+
+static void http_access_log(struct context *ctx, struct client *cl)
+{
+	// const char *method = http_hdr_get_method(cl);
+	// const char *uri = http_hdr_get_uri(cl);
+	// const char *qs = http_hdr_get_qs(cl);
+	// time_t t = time(NULL);
+	// char time_buf[32];
+
+	// strftime(time_buf, sizeof(time_buf), "%d/%b/%Y:%H:%M:%S %z",
+	// 	 localtime(&t));
+
+	// printf("[%s] %s | %hd | %s %s%s%s\n",
+	//        time_buf,
+	//        get_str_ss(&cl->addr),
+	//        cl->res_hdr.status,
+	//        method, uri, qs ? "?" : "", qs ? qs : "");
+}
+
+static bool is_eligible_for_keep_alive(struct client *cl)
+{
+	struct http_req_hdr *hdr = &cl->req_hdr;
+	char *val;
+
+	val = http_req_hdr_get_field(hdr, "connection");
+	if (val)
+		return !strcmp(val, "keep-alive");
+
+	val = &hdr->buf[hdr->off_version];
+	return !strcmp(val, "HTTP/1.1");
+}
+
+static int parse_http_req_hdr(struct context *ctx, struct client *cl)
 {
 	struct http_req_hdr *hdr = &cl->req_hdr;
 	char *buf = cl->buf;
 	char *second_line;
 	char *crlf;
+	size_t len;
 	int ret;
 
 	cl->state = T_CL_RECV_REQ_HDR;
@@ -1451,29 +1283,107 @@ static int parse_http_req_hdr(struct client *cl)
 	if (!crlf)
 		return 0;
 
-	hdr->buf = strndup(buf, crlf - buf);
+	len = (size_t)(crlf - buf) + 5u;
+	hdr->buf = memdup(buf, len);
 	if (!hdr->buf) {
 		errno = ENOMEM;
-		perror("strndup() in parse_http_req_hdr()");
+		perror("memdup() in parse_http_req_hdr()");
 		return -ENOMEM;
 	}
 
+	hdr->buf[len - 1u] = '\0';
+	hdr->buf_len = len - 1u;
 	ret = parse_hdr_req_parse_method_uri_qs(hdr, &second_line);
 	if (ret < 0)
 		return ret;
-
-	/*
-	 * Kill the LF, but don't kill the CR, the below function
-	 * call needs the CR.
-	 */
-	crlf[1] = '\0';
 
 	ret = parse_hdr_req_parse_fields(second_line, hdr);
 	if (ret < 0)
 		return ret;
 
+	cl->keep_alive = is_eligible_for_keep_alive(cl);
 	cl->state = T_CL_RECV_REQ_BODY;
+
+	/*
+	 * Is the body already in the buffer?
+	 *
+	 * If so, handle it. Otherwise, wait for the next
+	 * recv() call.
+	 */
+	if (cl->buf_pos > hdr->buf_len) {
+		memmove(cl->buf, &cl->buf[hdr->buf_len], cl->buf_pos - hdr->buf_len);
+		cl->buf_pos -= hdr->buf_len;
+	} else {
+		cl->buf_pos = 0;
+	}
+
+	return handle_client_recv_event(ctx, cl);
+}
+
+static int parse_http_req_body(struct context *ctx, struct client *cl)
+{
+	struct http_req_hdr *hdr = &cl->req_hdr;
+
+	switch (hdr->content_length) {
+	case CONTENT_LENGTH_NOT_PRESENT:
+	case CONTENT_LENGTH_CHUNKED:
+	case CONTENT_LENGTH_INVALID:
+		/*
+		 * No body.
+		 */
+		cl->state = T_CL_ROUTING;
+		return handle_client_recv_event(ctx, cl);
+	case CONTENT_LENGTH_UNINITIALIZED:
+		/*
+		 * Must not happen.
+		 */
+		abort();
+		break;
+	}
+
+	/*
+	 * Content-Length is present.
+	 */
+
+	cl->total_body_len += cl->buf_pos;
+	if (cl->total_body_len > hdr->content_length)
+		return -EINVAL;
+
+	if (cl->total_body_len == hdr->content_length) {
+		cl->state = T_CL_ROUTING;
+		return handle_client_recv_event(ctx, cl);
+	}
+
 	return 0;
+}
+
+static int handle_client_recv_event(struct context *ctx, struct client *cl)
+{
+	int ret = 0;
+
+	switch (cl->state) {
+	case T_CL_IDLE:
+	case T_CL_RECV_REQ_HDR:
+		ret = parse_http_req_hdr(ctx, cl);
+		break;
+	case T_CL_RECV_REQ_BODY:
+		ret = parse_http_req_body(ctx, cl);
+		break;
+	case T_CL_ROUTING:
+		ret = exec_http_route(ctx, cl);
+		http_access_log(ctx, cl);
+		break;
+	case T_CL_SEND_RES_HDR:
+	case T_CL_SEND_RES_BODY:
+		break;
+	default:
+		printf("Invalid ct->state = %hhu (fd=%d; idx=%u; addr=%s)\n",
+		       cl->state, cl->fd, cl->id, get_str_ss(&cl->addr));
+		abort();
+		break;
+	}
+
+	return ret;
 }
 
 static int handle_client_recv(struct context *ctx, struct client *cl)
@@ -1484,23 +1394,417 @@ static int handle_client_recv(struct context *ctx, struct client *cl)
 	if (ret)
 		return ret;
 
-	switch (cl->state) {
-	case T_CL_IDLE:
-		ret = parse_http_req_hdr(cl);
+	ret = handle_client_recv_event(ctx, cl);
+	if (ret == -EAGAIN)
+		return 0;
+
+	return ret;
+}
+
+char *http_req_hdr_get_field(struct http_req_hdr *hdr, const char *key)
+{
+	struct http_hdr_field_off *fields = hdr->fields;
+	uint16_t nr_fields = hdr->nr_fields;
+	uint16_t i;
+
+	for (i = 0; i < nr_fields; i++) {
+		struct http_hdr_field_off *field = &fields[i];
+		char *ptr = &hdr->buf[field->off_key];
+
+		if (!strcmp(ptr, key))
+			return &hdr->buf[field->off_val];
+	}
+
+	return NULL;
+}
+
+static int http_res_hdr_add_field(struct http_res_hdr *hdr, char *key, char *val)
+{
+	struct http_hdr_field *tmp, *fields = hdr->fields;
+	uint16_t nr_fields = hdr->nr_fields;
+
+	nr_fields++;
+	tmp = realloc(fields, nr_fields * sizeof(*fields));
+	if (!tmp) {
+		errno = ENOMEM;
+		perror("realloc() in http_res_hdr_add_field()");
+		return -ENOMEM;
+	}
+
+	fields = tmp;
+	hdr->fields = fields;
+	hdr->nr_fields = nr_fields;
+
+	tmp = &fields[nr_fields - 1];
+	tmp->key = key;
+	tmp->val = val;
+	return 0;
+}
+
+int http_add_res_hdr(struct client *cl, const char *key, const char *val, ...)
+{
+	char *kkey, *vval;
+	va_list ap;
+	int ret;
+
+	kkey = strdup(key);
+	if (!kkey) {
+		errno = ENOMEM;
+		perror("strdup() in http_add_res_hdr()");
+		return -ENOMEM;
+	}
+
+	va_start(ap, val);
+	ret = vasprintf(&vval, val, ap);
+	va_end(ap);
+	if (ret < 0) {
+		errno = ENOMEM;
+		perror("vasprintf() in http_add_res_hdr()");
+		free(kkey);
+		return -ENOMEM;
+	}
+
+	ret = http_res_hdr_add_field(&cl->res_hdr, kkey, vval);
+	if (ret) {
+		free(kkey);
+		free(vval);
+		return ret;
+	}
+
+	return 0;
+}
+
+int http_add_res_body(struct client *cl, const void *buf, size_t size)
+{
+	struct http_res_body *body = &cl->res_body;
+	struct res_body_buf *bufp = &body->buf;
+	void *tmp;
+
+	assert(body->type == T_RES_BODY_UINITIALIZED ||
+	       body->type == T_RES_BODY_BUFFER);
+
+	if (body->type == T_RES_BODY_UINITIALIZED) {
+		body->type = T_RES_BODY_BUFFER;
+		bufp->buf = memdup(buf, size);
+		bufp->len = size;
+		bufp->off = 0u;
+		if (!bufp->buf) {
+			errno = ENOMEM;
+			perror("memdup() in http_add_res_body()");
+			return -ENOMEM;
+		}
+		return 0;
+	}
+
+	tmp = realloc(bufp->buf, bufp->len + size);
+	if (!tmp) {
+		errno = ENOMEM;
+		perror("realloc() in http_add_res_body()");
+		return -ENOMEM;
+	}
+
+	bufp->buf = tmp;
+	memcpy(&bufp->buf[bufp->len], buf, size);
+	bufp->len += size;
+	return 0;
+}
+
+int http_set_res_body_map(struct client *cl, char *amap, uint64_t off,
+			  uint64_t size, bool need_unmap)
+{
+	struct http_res_body *body = &cl->res_body;
+	struct res_body_map *map = &body->map;
+
+	assert(body->type == T_RES_BODY_UINITIALIZED);
+	body->type = T_RES_BODY_MAP;
+
+	map->map = (uint8_t *)amap;
+	map->off = off;
+	map->size = size;
+	map->need_unmap = need_unmap;
+
+	return 0;
+}
+
+static const char *http_code_to_str(int code)
+{
+	switch (code) {
+	case 200:
+		return "OK";
+	case 201:
+		return "Created";
+	case 202:
+		return "Accepted";
+	case 203:
+		return "Non-Authoritative Information";
+	case 204:
+		return "No Content";
+	case 205:
+		return "Reset Content";
+	case 206:
+		return "Partial Content";
+	case 301:
+		return "Moved Permanently";
+	case 302:
+		return "Found";
+	case 303:
+		return "See Other";
+	case 304:
+		return "Not Modified";
+	case 307:
+		return "Temporary Redirect";
+	case 308:
+		return "Permanent Redirect";
+	case 400:
+		return "Bad Request";
+	case 401:
+		return "Unauthorized";
+	case 403:
+		return "Forbidden";
+	case 404:
+		return "Not Found";
+	case 500:
+		return "Internal Server Error";
+	case 501:
+		return "Not Implemented";
+	case 503:
+		return "Service Unavailable";
+	default:
+		return "";
+	}
+}
+
+static int construct_http_res_hdr(struct client *cl)
+{
+	struct http_req_hdr *req_hdr = &cl->req_hdr;
+	struct http_res_hdr *res_hdr = &cl->res_hdr;
+	size_t len, i;
+	char *buf;
+
+	len = (size_t)snprintf(NULL, 0,
+			       "%s %d %s\r\n\r\n",
+			       &req_hdr->buf[req_hdr->off_version],
+			       res_hdr->status,
+			       http_code_to_str(res_hdr->status));
+
+	for (i = 0; i < res_hdr->nr_fields; i++) {
+		struct http_hdr_field *field = &res_hdr->fields[i];
+
+		len += strlen(field->key);
+		len += strlen(field->val);
+		len += sizeof(": ") - 1;
+		len += sizeof("\r\n") - 1;
+	}
+
+	buf = malloc(len + 1u);
+	if (!buf) {
+		errno = ENOMEM;
+		perror("malloc() in construct_http_res_hdr()");
+		return -ENOMEM;
+	}
+
+	len = (size_t)snprintf(buf, len + 1u,
+			       "%s %d %s\r\n",
+			       &req_hdr->buf[req_hdr->off_version],
+			       res_hdr->status,
+			       http_code_to_str(res_hdr->status));
+
+	for (i = 0; i < res_hdr->nr_fields; i++) {
+		struct http_hdr_field *field = &res_hdr->fields[i];
+
+		len += sprintf(&buf[len], "%s: %s\r\n", field->key, field->val);
+	}
+
+	buf[len++] = '\r';
+	buf[len++] = '\n';
+	buf[len] = '\0';
+
+	res_hdr->buf = buf;
+	res_hdr->buf_len = len;
+	res_hdr->buf_off = 0u;
+	return 0;
+}
+
+int http_res_commit(struct context *ctx, struct client *cl)
+{
+	int ret;
+
+	ret = construct_http_res_hdr(cl);
+	if (ret)
+		return ret;
+
+	cl->ep_event->events |= EPOLLOUT;
+	cl->state = T_CL_SEND_RES_HDR;
+	return 0;
+}
+
+static int do_send(struct client *cl, const void *buf, size_t len)
+{
+	ssize_t ret;
+
+	ret = send(cl->fd, buf, len, MSG_DONTWAIT);
+	if (ret < 0) {
+		ret = -errno;
+		if (ret == -EAGAIN)
+			return 0;
+
+		perror("send() in do_send()");
+	}
+
+	return (int)ret;
+}
+
+static int handle_client_send_event(struct context *ctx, struct client *cl);
+
+static int handle_client_send_event_header(struct context *ctx, struct client *cl)
+{
+	struct http_res_hdr *hdr = &cl->res_hdr;
+	size_t len;
+	char *buf;
+	int ret;
+
+	buf = hdr->buf + hdr->buf_off;
+	len = hdr->buf_len - hdr->buf_off;
+	ret = do_send(cl, buf, len);
+	if (ret < 0)
+		return ret;
+
+	hdr->buf_off += (uint32_t)ret;
+	if (hdr->buf_off < hdr->buf_len)
+		return -EAGAIN;
+
+	if (cl->res_body.type != T_RES_BODY_UINITIALIZED) {
+		cl->state = T_CL_SEND_RES_BODY;
+		return handle_client_send_event(ctx, cl);
+	}
+
+	return 0;
+}
+
+static int handle_client_send_body_map(struct context *ctx, struct client *cl)
+{
+	struct http_res_body *body = &cl->res_body;
+	uint8_t *buf;
+	size_t len;
+	int ret;
+
+	buf = body->map.map + body->map.off;
+	len = body->map.size - body->map.off;
+	ret = do_send(cl, buf, len);
+	if (ret < 0)
+		return ret;
+
+	body->map.off += (uint32_t)ret;
+	if (body->map.off < body->map.size)
+		return -EAGAIN;
+
+	return 0;
+}
+
+static int handle_client_send_body_buffer(struct context *ctx, struct client *cl)
+{
+	struct http_res_body *body = &cl->res_body;
+	struct res_body_buf *bufp = &body->buf;
+	uint8_t *buf;
+	size_t len;
+	int ret;
+
+	buf = bufp->buf + bufp->off;
+	len = bufp->len - bufp->off;
+	ret = do_send(cl, buf, len);
+	if (ret < 0)
+		return ret;
+
+	bufp->off += (uint32_t)ret;
+	if (bufp->off < bufp->len)
+		return -EAGAIN;
+
+	return 0;
+}
+
+static int handle_client_send_event_body(struct context *ctx, struct client *cl)
+{
+	struct http_res_body *body = &cl->res_body;
+	int ret = 0;
+
+	switch (body->type) {
+	case T_RES_BODY_BUFFER:
+		ret = handle_client_send_body_buffer(ctx, cl);
 		break;
+	case T_RES_BODY_FD:
+		ret = 0;
+		break;
+	case T_RES_BODY_MAP:
+		ret = handle_client_send_body_map(ctx, cl);
+		break;
+	case T_RES_BODY_UINITIALIZED:
+		/*
+		 * Must not happen.
+		 */
+		abort();
+		break;
+	}
+
+	if (!ret) {
+		if (cl->keep_alive) {
+			if (cl->pollout_set) {
+				union epoll_data data;
+
+				data.ptr = cl;
+				ret = epoll_mod(ctx, cl->fd, EPOLLIN, data);
+				if (ret)
+					return ret;
+
+				cl->pollout_set = false;
+			}
+
+			cl->state = T_CL_IDLE;
+			reset_client_keep_alive(cl);
+		} else {
+			return -ENETRESET;
+		}
+	}
+
+	return ret;
+}
+
+static int handle_client_send_event(struct context *ctx, struct client *cl)
+{
+	int ret = 0;
+
+	switch (cl->state) {
+	case T_CL_SEND_RES_HDR:
+		ret = handle_client_send_event_header(ctx, cl);
+		break;
+	case T_CL_SEND_RES_BODY:
+		ret = handle_client_send_event_body(ctx, cl);
+		break;
+	default:
+		break;
+	}
+
+	if (ret == -EAGAIN && !cl->pollout_set) {
+		union epoll_data data;
+
+		printf("setting epollout!\n");
+		data.ptr = cl;
+		ret = epoll_mod(ctx, cl->fd, EPOLLIN | EPOLLOUT, data);
+		if (ret)
+			return ret;
+
+		cl->pollout_set = true;
+		return 0;
 	}
 
 	if (ret == -EAGAIN)
 		return 0;
 
-	return 0;
+	return ret;
 }
 
 static int handle_client_send(struct context *ctx, struct client *cl)
 {
-	(void) ctx;
-	(void) cl;
-	return 0;
+	return handle_client_send_event(ctx, cl);
 }
 
 static int handle_client_event(struct context *ctx, struct epoll_event *event)
@@ -1509,6 +1813,7 @@ static int handle_client_event(struct context *ctx, struct epoll_event *event)
 	int ret = 0;
 
 	cl->last_active = ctx->now;
+	cl->ep_event = event;
 
 	if (event->events & EPOLLIN) {
 		ret = handle_client_recv(ctx, cl);
@@ -1529,6 +1834,7 @@ out:
 	if (ret)
 		put_client_slot(ctx, cl);
 
+	cl->ep_event = NULL;
 	return 0;
 }
 
@@ -1546,7 +1852,7 @@ static int handle_event(struct context *ctx, struct epoll_event *event)
 static int handle_events(struct context *ctx, int nr_polled_events)
 {
 	struct epoll_event *events = ctx->events;
-	int i, ret;
+	int i, ret = 0;
 
 	for (i = 0; i < nr_polled_events; i++) {
 		ret = handle_event(ctx, &events[i]);
@@ -1613,14 +1919,12 @@ static void destroy_context(struct context *ctx)
 	destroy_epoll(ctx);
 	destroy_client_slot(ctx);
 	destroy_tcp_socket(ctx);
+	exec_destroy_http_route(ctx);
 }
 
 static int run_app(struct context *ctx)
 {
 	int ret;
-
-	ctx->epoll_fd = -1;
-	ctx->tcp_fd = -1;
 
 	ret = parse_mysql_env(&ctx->mysql_cred);
 	if (ret)
@@ -1646,10 +1950,14 @@ static int run_app(struct context *ctx)
 	if (ret)
 		goto out;
 
+	ret = exec_init_http_route(ctx);
+	if (ret)
+		goto out;
+
 	ret = run_event_loop(ctx);
+
 out:
 	destroy_context(ctx);
-	g_ctx = NULL;
 	return ret;
 }
 
