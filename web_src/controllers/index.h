@@ -6,6 +6,6 @@
 
 int route_index(struct context *ctx, struct client *cl);
 int route_init_index(struct context *ctx);
-int route_destroy_index(struct context *ctx);
+void route_destroy_index(struct context *ctx);
 
 #endif

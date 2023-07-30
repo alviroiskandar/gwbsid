@@ -62,11 +62,8 @@ int route_init_index(struct context *ctx)
 	return 0;
 }
 
-int route_destroy_index(struct context *ctx)
+void route_destroy_index(struct context *ctx)
 {
-	if (!index_html)
-		return 0;
-
-	munmap((void *)index_html, index_html_len);
-	return 0;
+	if (index_html)
+		munmap((void *)index_html, index_html_len);
 }
